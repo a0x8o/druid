@@ -1,0 +1,30 @@
+Apache Druid (incubating)
+Copyright 2019 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+
+############ SOURCE/JAVA-CORE ############
+
+================= Apache Calcite 1.10.0 =================
+Apache Calcite
+Copyright 2012-2019 The Apache Software Foundation
+
+This product is based on source code originally developed
+by DynamoBI Corporation, LucidEra Inc., SQLstream Inc. and others
+under the auspices of the Eigenbase Foundation
+and released as the LucidDB project.
+
+
+
+
+================= Metamarkets extendedset 1.3.10 =================
+extendedset
+Copyright 2012 Metamarkets Group Inc.
+
+-------------------------------------------------------------------------------
+
+This library contains a modified version of Alessandro Colantonio's CONCISE
+(COmpressed 'N' Composable Integer SEt) library, extending the functionality of
+ConciseSet to use IntBuffers.
