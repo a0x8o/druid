@@ -32,6 +32,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
@@ -348,59 +349,21 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
 
   protected class CheckpointNotice implements Notice
   {
-    @Nullable
-    private final Integer nullableTaskGroupId;
-    @Deprecated
-    private final String baseSequenceName;
+    private final int taskGroupId;
     private final SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> checkpointMetadata;
 
     CheckpointNotice(
-        @Nullable Integer nullableTaskGroupId,
-        @Deprecated String baseSequenceName,
+        int taskGroupId,
         SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> checkpointMetadata
     )
     {
-      this.baseSequenceName = baseSequenceName;
-      this.nullableTaskGroupId = nullableTaskGroupId;
+      this.taskGroupId = taskGroupId;
       this.checkpointMetadata = checkpointMetadata;
     }
 
     @Override
     public void handle() throws ExecutionException, InterruptedException
     {
-      // Find taskGroupId using taskId if it's null. It can be null while rolling update.
-      final int taskGroupId;
-      if (nullableTaskGroupId == null) {
-        // We search taskId in activelyReadingTaskGroups and pendingCompletionTaskGroups sequentially. This should be fine because
-        // 1) a taskGroup can be moved from activelyReadingTaskGroups to pendingCompletionTaskGroups in RunNotice
-        //    (see checkTaskDuration()).
-        // 2) Notices are proceesed by a single thread. So, CheckpointNotice and RunNotice cannot be processed at the
-        //    same time.
-        final java.util.Optional<Integer> maybeGroupId = activelyReadingTaskGroups
-            .entrySet()
-            .stream()
-            .filter(entry -> {
-              final TaskGroup taskGroup = entry.getValue();
-              return taskGroup.baseSequenceName.equals(baseSequenceName);
-            })
-            .findAny()
-            .map(Entry::getKey);
-
-        taskGroupId = maybeGroupId.orElseGet(() -> pendingCompletionTaskGroups
-            .entrySet()
-            .stream()
-            .filter(entry -> {
-              final List<TaskGroup> taskGroups = entry.getValue();
-              return taskGroups.stream().anyMatch(group -> group.baseSequenceName.equals(baseSequenceName));
-            })
-            .findAny()
-            .orElseThrow(() -> new ISE("Cannot find taskGroup for baseSequenceName[%s]", baseSequenceName))
-            .getKey());
-
-      } else {
-        taskGroupId = nullableTaskGroupId;
-      }
-
       // check for consistency
       // if already received request for this sequenceName and dataSourceMetadata combination then return
       final TaskGroup taskGroup = activelyReadingTaskGroups.get(taskGroupId);
@@ -515,6 +478,7 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
   private long lastRunTime;
   private int initRetryCounter = 0;
   private volatile DateTime firstRunTime;
+  private volatile DateTime earlyStopTime = null;
   private volatile RecordSupplier<PartitionIdType, SequenceOffsetType> recordSupplier;
   private volatile boolean started = false;
   private volatile boolean stopped = false;
@@ -1852,46 +1816,13 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
     return false;
   }
 
-  /**
-   *
-   * Some seekable stream systems such as Kinesis allow partitions to expire. When this occurs, the supervisor should
-   * remove the expired partitions from saved metadata and from the partition groups stored in memory.
-   *
-   * @param currentMetadata The current DataSourceMetadata from metadata storage
-   * @param expiredPartitionIds The set of expired partition IDs.
-   * @return currentMetadata but with any expired partitions removed.
-   */
-  protected SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> createDataSourceMetadataWithoutExpiredPartitions(
-      SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> currentMetadata,
-      Set<PartitionIdType> expiredPartitionIds
-  )
-  {
-    throw new UnsupportedOperationException("This supervisor type does not support partition expiration.");
-  }
-
-  /**
-   * Removes a set of expired partition IDs from partitionIds and partitionGroups. This is called after
-   * successfully removing expired partitions from metadata, for supervisor types that support partition expiration.
-   *
-   * @param expiredPartitionIds Set of expired partition IDs.
-   */
-  private void removeExpiredPartitionsFromMemory(Set<PartitionIdType> expiredPartitionIds)
-  {
-    partitionIds.removeAll(expiredPartitionIds);
-
-    for (ConcurrentHashMap<PartitionIdType, SequenceOffsetType> partitionGroup : partitionGroups.values()) {
-      for (PartitionIdType expiredShard : expiredPartitionIds) {
-        partitionGroup.remove(expiredShard);
-      }
-    }
-  }
-
   private boolean updatePartitionDataFromStream()
   {
-    Set<PartitionIdType> partitionIds;
+    List<PartitionIdType> previousPartitionIds = new ArrayList<>(partitionIds);
+    Set<PartitionIdType> partitionIdsFromSupplier;
     try {
       synchronized (recordSupplierLock) {
-        partitionIds = recordSupplier.getPartitionIds(ioConfig.getStream());
+        partitionIdsFromSupplier = recordSupplier.getPartitionIds(ioConfig.getStream());
       }
     }
     catch (Exception e) {
@@ -1901,24 +1832,55 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
       return false;
     }
 
-    if (partitionIds == null || partitionIds.size() == 0) {
+    if (partitionIdsFromSupplier == null || partitionIdsFromSupplier.size() == 0) {
       String errMsg = StringUtils.format("No partitions found for stream [%s]", ioConfig.getStream());
       stateManager.recordThrowableEvent(new StreamException(new ISE(errMsg)));
       log.warn(errMsg);
       return false;
     }
 
-    log.debug("Found [%d] partitions for stream [%s]", partitionIds.size(), ioConfig.getStream());
+    log.debug("Found [%d] partitions for stream [%s]", partitionIdsFromSupplier.size(), ioConfig.getStream());
 
-    Set<PartitionIdType> closedPartitions = getOffsetsFromMetadataStorage()
+    Map<PartitionIdType, SequenceOffsetType> storedMetadata = getOffsetsFromMetadataStorage();
+    Set<PartitionIdType> storedPartitions = storedMetadata.keySet();
+    Set<PartitionIdType> closedPartitions = storedMetadata
         .entrySet()
         .stream()
         .filter(x -> isEndOfShard(x.getValue()))
         .map(Entry::getKey)
         .collect(Collectors.toSet());
+    Set<PartitionIdType> previouslyExpiredPartitions = storedMetadata
+        .entrySet()
+        .stream()
+        .filter(x -> isShardExpirationMarker(x.getValue()))
+        .map(Entry::getKey)
+        .collect(Collectors.toSet());
+
+    Set<PartitionIdType> partitionIdsFromSupplierWithoutPreviouslyExpiredPartitions = Sets.difference(
+        partitionIdsFromSupplier,
+        previouslyExpiredPartitions
+    );
+
+    if (partitionIdsFromSupplierWithoutPreviouslyExpiredPartitions.size() != partitionIdsFromSupplier.size()) {
+      // this should never happen, but we check for it and exclude the expired partitions if they somehow reappear
+      log.warn(
+          "Previously expired partitions [%s] were present in the current list [%s] from the record supplier.",
+          previouslyExpiredPartitions,
+          partitionIdsFromSupplier
+      );
+    }
+    if (partitionIdsFromSupplierWithoutPreviouslyExpiredPartitions.size() == 0) {
+      String errMsg = StringUtils.format(
+          "No partitions found for stream [%s] after removing previously expired partitions",
+          ioConfig.getStream()
+      );
+      stateManager.recordThrowableEvent(new StreamException(new ISE(errMsg)));
+      log.warn(errMsg);
+      return false;
+    }
 
     boolean initialPartitionDiscovery = this.partitionIds.isEmpty();
-    for (PartitionIdType partitionId : partitionIds) {
+    for (PartitionIdType partitionId : partitionIdsFromSupplierWithoutPreviouslyExpiredPartitions) {
       if (closedPartitions.contains(partitionId)) {
         log.info("partition [%s] is closed and has no more data, skipping.", partitionId);
         continue;
@@ -1926,16 +1888,26 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
 
       if (!initialPartitionDiscovery && !this.partitionIds.contains(partitionId)) {
         subsequentlyDiscoveredPartitions.add(partitionId);
-        // should check for earlyPublishTime (Kinesis) here, not supported yet
       }
+    }
 
+
+    // When partitions expire, we need to recompute the task group assignments, considering only non-expired partitions,
+    // to ensure that we have even distribution of readable partitions across tasks.
+    if (supportsPartitionExpiration()) {
+      cleanupExpiredPartitions(
+          storedPartitions,
+          previouslyExpiredPartitions,
+          partitionIdsFromSupplier
+      );
+    }
+
+    for (PartitionIdType partitionId : partitionIdsFromSupplierWithoutPreviouslyExpiredPartitions) {
       int taskGroupId = getTaskGroupIdForPartition(partitionId);
-
       ConcurrentHashMap<PartitionIdType, SequenceOffsetType> partitionMap = partitionGroups.computeIfAbsent(
           taskGroupId,
           k -> new ConcurrentHashMap<>()
       );
-
       if (partitionMap.putIfAbsent(partitionId, getNotSetMarker()) == null) {
         log.info(
             "New partition [%s] discovered for stream [%s], added to task group [%d]",
@@ -1946,35 +1918,26 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
       }
     }
 
-    if (supportsPartitionExpiration()) {
-      // Look for expired shards and remove them from metadata storage and the partition groups
-      Set<PartitionIdType> expiredPartitions = new HashSet<>();
-      for (PartitionIdType partitionTd : closedPartitions) {
-        if (!partitionIds.contains(partitionTd)) {
-          expiredPartitions.add(partitionTd);
-        }
-      }
-
-      if (expiredPartitions.size() > 0) {
-        @SuppressWarnings("unchecked")
-        SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> currentMetadata =
-            (SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType>) indexerMetadataStorageCoordinator.getDataSourceMetadata(
-                dataSource);
-        SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> cleanedMetadata =
-            createDataSourceMetadataWithoutExpiredPartitions(currentMetadata, expiredPartitions);
-
-        validateMetadataPartitionExpiration(currentMetadata, cleanedMetadata);
-
-        try {
-          boolean success = indexerMetadataStorageCoordinator.resetDataSourceMetadata(dataSource, cleanedMetadata);
-          if (success) {
-            removeExpiredPartitionsFromMemory(expiredPartitions);
-          } else {
-            log.error("Failed to update datasource metadata[%s] with expired partitions removed", cleanedMetadata);
-          }
-        }
-        catch (IOException ioe) {
-          throw new RuntimeException(ioe);
+    if (!partitionIds.equals(previousPartitionIds)) {
+      // the set of partition IDs has changed, have any running tasks stop early so that we can adjust to the
+      // repartitioning quickly by creating new tasks
+      for (TaskGroup taskGroup : activelyReadingTaskGroups.values()) {
+        if (!taskGroup.taskIds().isEmpty()) {
+          // Partitions have changed and we are managing active tasks - set an early publish time
+          // at the current time + repartitionTransitionDuration.
+          // This allows time for the stream to start writing to the new partitions after repartitioning.
+          // For Kinesis ingestion, this cooldown time is particularly useful, lowering the possibility of
+          // the new shards being empty, which can cause issues presently
+          // (see https://github.com/apache/incubator-druid/issues/7600)
+          earlyStopTime = DateTimes.nowUtc().plus(tuningConfig.getRepartitionTransitionDuration());
+          log.info(
+              "Previous partition set [%s] has changed to [%s] - requesting that tasks stop after [%s] at [%s]",
+              previousPartitionIds,
+              partitionIds,
+              tuningConfig.getRepartitionTransitionDuration(),
+              earlyStopTime
+          );
+          break;
         }
       }
     }
@@ -1983,16 +1946,129 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
   }
 
   /**
+   * This method determines the set of expired partitions from the set of partitions currently returned by
+   * the record supplier and the set of partitions previously tracked in the metadata.
+   *
+   * It will mark the expired partitions in metadata and recompute the partition->task group mappings, updating
+   * the metadata, the partitionIds list, and the partitionGroups mappings.
+   *
+   * Note that partition IDs that were newly discovered (appears in record supplier set but not in metadata set)
+   * are not added to the recomputed partition groups here. This is handled later in
+   * {@link #updatePartitionDataFromStream} after this method is called.
+   *
+   * @param storedPartitions Set of partitions previously tracked, from the metadata store
+   * @param partitionIdsFromSupplier Set of partitions currently returned by the record supplier.
+   */
+  private void cleanupExpiredPartitions(
+      Set<PartitionIdType> storedPartitions,
+      Set<PartitionIdType> previouslyExpiredPartitions,
+      Set<PartitionIdType> partitionIdsFromSupplier
+  )
+  {
+    // If a partition was previously known (stored in metadata) but no longer appears in the list of partitions
+    // provided by the record supplier, it has expired.
+    Set<PartitionIdType> newlyExpiredPartitions = Sets.difference(storedPartitions, previouslyExpiredPartitions);
+    newlyExpiredPartitions = Sets.difference(newlyExpiredPartitions, partitionIdsFromSupplier);
+
+    if (newlyExpiredPartitions.size() > 0) {
+      log.info("Detected newly expired partitions: " + newlyExpiredPartitions);
+
+      // Mark partitions as expired in metadata
+      @SuppressWarnings("unchecked")
+      SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> currentMetadata =
+          (SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType>) indexerMetadataStorageCoordinator.getDataSourceMetadata(
+              dataSource);
+
+      SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> cleanedMetadata =
+          createDataSourceMetadataWithExpiredPartitions(currentMetadata, newlyExpiredPartitions);
+
+      log.info("New metadata after partition expiration: " + cleanedMetadata);
+
+      validateMetadataPartitionExpiration(newlyExpiredPartitions, currentMetadata, cleanedMetadata);
+
+      // Compute new partition groups, only including partitions that are
+      // still in partitionIdsFromSupplier
+      Map<Integer, ConcurrentHashMap<PartitionIdType, SequenceOffsetType>> newPartitionGroups =
+          recomputePartitionGroupsForExpiration(partitionIdsFromSupplier);
+
+      validatePartitionGroupReassignments(newPartitionGroups);
+
+      log.info("New partition groups after partition expiration: " + newPartitionGroups);
+
+      try {
+        boolean success = indexerMetadataStorageCoordinator.resetDataSourceMetadata(dataSource, cleanedMetadata);
+        if (success) {
+          partitionIds.clear();
+          partitionIds.addAll(partitionIdsFromSupplier);
+
+          for (Integer groupId : partitionGroups.keySet()) {
+            if (newPartitionGroups.containsKey(groupId)) {
+              partitionGroups.put(groupId, newPartitionGroups.get(groupId));
+            } else {
+              partitionGroups.put(groupId, new ConcurrentHashMap<>());
+            }
+          }
+        } else {
+          log.error("Failed to update datasource metadata[%s] with expired partitions removed", cleanedMetadata);
+        }
+      }
+      catch (IOException ioe) {
+        throw new RuntimeException(ioe);
+      }
+    }
+  }
+
+  /**
+   * When partitions are removed due to expiration it may be necessary to recompute the partitionID -> groupID
+   * mappings to ensure balanced distribution of partitions.
+   *
+   * This function should return a copy of partitionGroups, using the provided availablePartitions as the list of
+   * active partitions, reassigning partitions to different groups if necessary.
+   *
+   * If a partition is not in availablePartitions, it should be filtered out of the new partition groups returned
+   * by this method.
+   *
+   * @param availablePartitions
+   * @return a remapped copy of partitionGroups, containing only the partitions in availablePartitions
+   */
+  protected Map<Integer, ConcurrentHashMap<PartitionIdType, SequenceOffsetType>> recomputePartitionGroupsForExpiration(
+      Set<PartitionIdType> availablePartitions
+  )
+  {
+    throw new UnsupportedOperationException("This supervisor type does not support partition expiration.");
+  }
+
+  /**
+   *
+   * Some seekable stream systems such as Kinesis allow partitions to expire. When this occurs, the supervisor should
+   * mark the expired partitions in the saved metadata. This method returns a copy of the current metadata
+   * with any expired partitions marked with an implementation-specific offset value that represents the expired state.
+   *
+   * @param currentMetadata The current DataSourceMetadata from metadata storage
+   * @param expiredPartitionIds The set of expired partition IDs.
+   * @return currentMetadata but with any expired partitions removed.
+   */
+  protected SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> createDataSourceMetadataWithExpiredPartitions(
+      SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> currentMetadata,
+      Set<PartitionIdType> expiredPartitionIds
+  )
+  {
+    throw new UnsupportedOperationException("This supervisor type does not support partition expiration.");
+  }
+
+  /**
    * Perform a sanity check on the datasource metadata returned by
-   * {@link #createDataSourceMetadataWithoutExpiredPartitions}.
+   * {@link #createDataSourceMetadataWithExpiredPartitions}.
    *
    * Specifically, we check that the cleaned metadata's partitions are a subset of the original metadata's partitions,
-   * and that none of the offsets for the non-expired partitions have changed.
+   * that newly expired partitions are marked as expired, and that none of the offsets for the non-expired partitions
+   * have changed.
    *
    * @param oldMetadata metadata containing expired partitions.
    * @param cleanedMetadata new metadata without expired partitions, generated by the subclass
    */
   private void validateMetadataPartitionExpiration(
+      Set<PartitionIdType> newlyExpiredPartitions,
       SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> oldMetadata,
       SeekableStreamDataSourceMetadata<PartitionIdType, SequenceOffsetType> cleanedMetadata
   )
@@ -2015,13 +2091,68 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
       }
 
       SequenceOffsetType oldOffset = oldPartitionSeqNos.get(cleanedPartitionSeqNo.getKey());
-      if (!oldOffset.equals(cleanedPartitionSeqNo.getValue())) {
+      if (newlyExpiredPartitions.contains(cleanedPartitionSeqNo.getKey())) {
+        // this is a newly expired partition, check that we did actually mark it as expired
+        if (!isShardExpirationMarker(cleanedPartitionSeqNo.getValue())) {
+          throw new IAE(
+              "Newly expired partition [%] was not marked as expired in the cleaned partition map [%s], original partition map: [%s]",
+              cleanedPartitionSeqNo.getKey(),
+              cleanedPartitionSeqNos,
+              oldPartitionSeqNos
+          );
+        }
+      } else if (!oldOffset.equals(cleanedPartitionSeqNo.getValue())) {
+        // this is not an expired shard, check that the offset did not change
         throw new IAE(
             "Cleaned partition map [%s] has offset mismatch for partition ID [%s], original partition map: [%s]",
             cleanedPartitionSeqNos,
             cleanedPartitionSeqNo.getKey(),
             oldPartitionSeqNos
         );
+      }
+    }
+  }
+
+  /**
+   * Perform a sanity check on the new partition groups returned by
+   * {@link #recomputePartitionGroupsForExpiration}.
+   *
+   * Specifically, we check that the new partition groups' partitions are a subset of the original groups' partitions,
+   * and that none of the offsets for the non-expired partitions have changed.
+   *
+   * @param newPartitionGroups new metadata without expired partitions, generated by the subclass
+   */
+  private void validatePartitionGroupReassignments(
+      Map<Integer, ConcurrentHashMap<PartitionIdType, SequenceOffsetType>> newPartitionGroups
+  )
+  {
+    Map<PartitionIdType, SequenceOffsetType> oldPartitionMappings = new HashMap<>();
+    for (ConcurrentHashMap<PartitionIdType, SequenceOffsetType> oldGroup : partitionGroups.values()) {
+      // we don't care about old task group mappings, only the partition-offset mappings
+      oldPartitionMappings.putAll(oldGroup);
+    }
+
+    for (ConcurrentHashMap<PartitionIdType, SequenceOffsetType> newGroup : newPartitionGroups.values()) {
+      for (Entry<PartitionIdType, SequenceOffsetType> newPartitionMapping : newGroup.entrySet()) {
+        if (!oldPartitionMappings.containsKey(newPartitionMapping.getKey())) {
+          // recomputing the groups without the expired partitions added an unknown partition somehow
+          throw new IAE(
+              "Recomputed partition groups [%s] contains unexpected partition ID [%s], old partition groups: [%s]",
+              newPartitionGroups,
+              newPartitionMapping.getKey(),
+              partitionGroups
+          );
+        }
+
+        SequenceOffsetType oldOffset = oldPartitionMappings.get(newPartitionMapping.getKey());
+        if (!oldOffset.equals(newPartitionMapping.getValue())) {
+          throw new IAE(
+              "Recomputed partition groups [%s] has offset mismatch for partition ID [%s], original partition map: [%s]",
+              newPartitionGroups,
+              newPartitionMapping.getKey(),
+              partitionGroups
+          );
+        }
       }
     }
   }
@@ -2110,8 +2241,18 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
         }
       }
 
+
+      boolean stopTasksEarly = false;
+      if (earlyStopTime != null && (earlyStopTime.isBeforeNow() || earlyStopTime.isEqualNow())) {
+        log.info("Early stop requested - signalling tasks to complete");
+
+        earlyStopTime = null;
+        stopTasksEarly = true;
+      }
+
+
       // if this task has run longer than the configured duration, signal all tasks in the group to persist
-      if (earliestTaskStart.plus(ioConfig.getTaskDuration()).isBeforeNow()) {
+      if (earliestTaskStart.plus(ioConfig.getTaskDuration()).isBeforeNow() || stopTasksEarly) {
         log.info("Task group [%d] has run for [%s]", groupId, ioConfig.getTaskDuration());
         futureGroupIds.add(groupId);
         futures.add(checkpointTaskGroup(group, true));
@@ -2507,7 +2648,7 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
    * should be removed from the starting offsets sent to the tasks.
    *
    * @param startingOffsets
-   * @return
+   * @return startingOffsets with entries for expired partitions removed
    */
   protected Map<PartitionIdType, OrderedSequenceNumber<SequenceOffsetType>> filterExpiredPartitionsFromStartingOffsets(
       Map<PartitionIdType, OrderedSequenceNumber<SequenceOffsetType>> startingOffsets
@@ -2531,10 +2672,14 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
     for (Integer groupId : partitionGroups.keySet()) {
       if (!activelyReadingTaskGroups.containsKey(groupId)) {
         log.info("Creating new task group [%d] for partitions %s", groupId, partitionGroups.get(groupId).keySet());
-
-        Optional<DateTime> minimumMessageTime = (ioConfig.getLateMessageRejectionPeriod().isPresent() ? Optional.of(
-            DateTimes.nowUtc().minus(ioConfig.getLateMessageRejectionPeriod().get())
-        ) : Optional.absent());
+        Optional<DateTime> minimumMessageTime;
+        if (ioConfig.getLateMessageRejectionStartDateTime().isPresent()) {
+          minimumMessageTime = Optional.of(ioConfig.getLateMessageRejectionStartDateTime().get());
+        } else {
+          minimumMessageTime = (ioConfig.getLateMessageRejectionPeriod().isPresent() ? Optional.of(
+                                DateTimes.nowUtc().minus(ioConfig.getLateMessageRejectionPeriod().get())
+                               ) : Optional.absent());
+        }
 
         Optional<DateTime> maximumMessageTime = (ioConfig.getEarlyMessageRejectionPeriod().isPresent() ? Optional.of(
             DateTimes.nowUtc().plus(ioConfig.getTaskDuration()).plus(ioConfig.getEarlyMessageRejectionPeriod().get())
@@ -2688,7 +2833,7 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
     if (sequence != null) {
       log.debug("Getting sequence [%s] from metadata storage for partition [%s]", sequence, partition);
       if (!taskTuningConfig.isSkipSequenceNumberAvailabilityCheck()) {
-        if (!checkSequenceAvailability(partition, sequence)) {
+        if (!checkOffsetAvailability(partition, sequence)) {
           if (taskTuningConfig.isResetOffsetAutomatically()) {
             resetInternal(
                 createDataSourceMetaDataForReset(ioConfig.getStream(), ImmutableMap.of(partition, sequence))
@@ -2950,11 +3095,7 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
   }
 
   @Override
-  public void checkpoint(
-      @Nullable Integer taskGroupId,
-      @Deprecated String baseSequenceName,
-      DataSourceMetadata checkpointMetadata
-  )
+  public void checkpoint(int taskGroupId, DataSourceMetadata checkpointMetadata)
   {
     Preconditions.checkNotNull(checkpointMetadata, "checkpointMetadata");
 
@@ -2974,7 +3115,7 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
     );
 
     log.info("Checkpointing [%s] for taskGroup [%s]", checkpointMetadata, taskGroupId);
-    addNotice(new CheckpointNotice(taskGroupId, baseSequenceName, seekableMetadata));
+    addNotice(new CheckpointNotice(taskGroupId, seekableMetadata));
   }
 
   @VisibleForTesting
@@ -3113,23 +3254,19 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
   );
 
   /**
-   * checks if sequence from metadata storage is still valid
+   * checks if offset from metadata storage is still valid
    *
    * @return true if still valid else false
    */
-  private boolean checkSequenceAvailability(
+  private boolean checkOffsetAvailability(
       @NotNull PartitionIdType partition,
-      @NotNull SequenceOffsetType sequenceFromMetadata
+      @NotNull SequenceOffsetType offsetFromMetadata
   )
   {
-    SequenceOffsetType earliestSequence = getOffsetFromStreamForPartition(partition, true);
-    SequenceOffsetType latestSequence = getOffsetFromStreamForPartition(partition, false);
-    return (earliestSequence == null
-            || makeSequenceNumber(earliestSequence).compareTo(makeSequenceNumber(sequenceFromMetadata)) <= 0)
-           && (latestSequence == null
-               || makeSequenceNumber(latestSequence).compareTo(makeSequenceNumber(sequenceFromMetadata)) >= 0);
+    final SequenceOffsetType earliestOffset = getOffsetFromStreamForPartition(partition, true);
+    return earliestOffset != null
+           && makeSequenceNumber(earliestOffset).compareTo(makeSequenceNumber(offsetFromMetadata)) <= 0;
   }
-
 
   /**
    * a special sequence number that is used to indicate that the sequence offset
@@ -3151,9 +3288,14 @@ public abstract class SeekableStreamSupervisor<PartitionIdType, SequenceOffsetTy
   protected abstract SequenceOffsetType getEndOfPartitionMarker();
 
   /**
-   * checks if seqNum marks the end of a Kinesis shard. Used by Kinesis only.
+   * checks if seqNum marks the end of a Kinesis shard. This indicates that the shard is closed. Used by Kinesis only.
    */
   protected abstract boolean isEndOfShard(SequenceOffsetType seqNum);
+
+  /**
+   * checks if seqNum marks an expired Kinesis shard. Used by Kinesis only.
+   */
+  protected abstract boolean isShardExpirationMarker(SequenceOffsetType seqNum);
 
   /**
    * Returns true if the start sequence number should be exclusive for the non-first sequences for the whole partition.

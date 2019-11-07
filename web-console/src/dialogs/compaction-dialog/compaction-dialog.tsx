@@ -20,6 +20,7 @@ import { Button, Classes, Dialog, Intent } from '@blueprintjs/core';
 import React from 'react';
 
 import { AutoForm, ExternalLink } from '../../components';
+import { DRUID_DOCS_VERSION } from '../../variables';
 
 import './compaction-dialog.scss';
 
@@ -40,7 +41,7 @@ export class CompactionDialog extends React.PureComponent<
   CompactionDialogProps,
   CompactionDialogState
 > {
-  static DEFAULT_TARGET_COMPACTION_SIZE_BYTES = 419430400;
+  static DEFAULT_MAX_ROWS_PER_SEGMENT = 5000000;
 
   constructor(props: CompactionDialogProps) {
     super(props);
@@ -108,9 +109,9 @@ export class CompactionDialog extends React.PureComponent<
               ),
             },
             {
-              name: 'targetCompactionSizeBytes',
+              name: 'maxRowsPerSegment',
               type: 'number',
-              defaultValue: CompactionDialog.DEFAULT_TARGET_COMPACTION_SIZE_BYTES,
+              defaultValue: CompactionDialog.DEFAULT_MAX_ROWS_PER_SEGMENT,
               info: (
                 <p>
                   The target segment size, for each segment, after compaction. The actual sizes of
@@ -125,7 +126,9 @@ export class CompactionDialog extends React.PureComponent<
               type: 'json',
               info: (
                 <p>
-                  <ExternalLink href="https://druid.apache.org/docs/latest/ingestion/tasks.html#task-context">
+                  <ExternalLink
+                    href={`https://druid.apache.org/docs/${DRUID_DOCS_VERSION}/ingestion/tasks.html#task-context`}
+                  >
                     Task context
                   </ExternalLink>{' '}
                   for compaction tasks.
@@ -143,7 +146,9 @@ export class CompactionDialog extends React.PureComponent<
               type: 'json',
               info: (
                 <p>
-                  <ExternalLink href="https://druid.apache.org/docs/latest/configuration/index.html#compact-task-tuningconfig">
+                  <ExternalLink
+                    href={`https://druid.apache.org/docs/${DRUID_DOCS_VERSION}/configuration/index.html#compact-task-tuningconfig`}
+                  >
                     Tuning config
                   </ExternalLink>{' '}
                   for compaction tasks.
