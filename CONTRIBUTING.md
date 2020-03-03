@@ -1,171 +1,63 @@
-<!--
-  ~ Licensed to the Apache Software Foundation (ASF) under one
-  ~ or more contributor license agreements.  See the NOTICE file
-  ~ distributed with this work for additional information
-  ~ regarding copyright ownership.  The ASF licenses this file
-  ~ to you under the Apache License, Version 2.0 (the
-  ~ "License"); you may not use this file except in compliance
-  ~ with the License.  You may obtain a copy of the License at
-  ~
-  ~   http://www.apache.org/licenses/LICENSE-2.0
-  ~
-  ~ Unless required by applicable law or agreed to in writing,
-  ~ software distributed under the License is distributed on an
-  ~ "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  ~ KIND, either express or implied.  See the License for the
-  ~ specific language governing permissions and limitations
-  ~ under the License.
-  -->
+# Contributing to Bistro
 
-# How to Contribute
+We want to make contributing to this project as easy and transparent as
+possible.
 
-When submitting a pull request (PR), please use the following guidelines:
+## Our Development Process
 
-- Make sure your code respects existing formatting conventions. In general, follow
-  the same coding style as the code that you are modifying.
-- For Intellij you can import our code style settings xml: [`druid_intellij_formatting.xml`](
-  https://github.com/apache/incubator-druid/raw/master/dev/druid_intellij_formatting.xml).
-- For Eclipse you can import our code style settings xml: [`eclipse_formatting.xml`](
-  https://github.com/apache/incubator-druid/raw/master/dev/eclipse_formatting.xml).
-- Do add/update documentation appropriately for the change you are making.
-- If you are introducing a new feature you may want to first write about your idea
-  for feedback to [dev@druid.apache.org](https://lists.apache.org/list.html?dev@druid.apache.org). Or create an issue
-  using "Feature/Change" template. Non-trivial features should include unit tests covering the new functionality. Open
-  a "Proposal" issue for large changes.
-- Bugfixes should include a unit test or integration test reproducing the issue.
-- Do not use author tags/information in the code.
-- Try to keep pull requests short and submit separate ones for unrelated
-  features, but feel free to combine simple bugfixes/tests into one pull request.
-- If you are adding or updating a dependency, be sure to update the version, license, or notice information in
-  [licenses.yaml](https://github.com/apache/incubator-druid/blob/master/licenses.yaml) as appropriate to help ease
-  LICENSE and NOTICE management for ASF releases.
+Our changes are first made in Facebook's internal repository, which provides
+us with additional lint and static analysis support.  Changes are
+synchronized periodically to Github, with the goal of maintaining a passing
+Travis CI build at all times.
 
-You can find more developers' resources in [`dev/`](dev) directory.
+## Pull Requests
 
-## GitHub Workflow
+We actively welcome your pull requests.
+1. Fork the repo and create your branch from `master`.
+2. If you've added code that should be tested, add tests.
+3. If you've changed APIs, update the documentation in the `gh-pages` branch.
+4. Ensure the test suite passes.
+5. Make sure your code lints.
+6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
-1. Fork the apache/incubator-druid repository into your GitHub account
+## Contributor License Agreement ("CLA")
 
-    https://github.com/apache/incubator-druid/fork
+In order to accept your pull request, we need you to submit a CLA. You only need
+to do this once to work on any of Facebook's open source projects.
 
-1. Clone your fork of the GitHub repository
+Complete your CLA here: <https://code.facebook.com/cla>
 
-    ```sh
-    git clone git@github.com:<username>/incubator-druid.git
-    ```
+## Issues
 
-    replace `<username>` with your GitHub username.
+We use GitHub issues to track public bugs. Please ensure your description is
+clear and has sufficient instructions to be able to reproduce the issue.
 
-1. Add a remote to keep up with upstream changes
+Facebook has a [bounty program](https://www.facebook.com/whitehat/) for the
+safe disclosure of security bugs.  In those cases, please go through the
+process outlined on that page and do not file a public issue.
 
-    ```
-    git remote add upstream https://github.com/apache/incubator-druid.git
-    ```
+## Coding Style
 
-    If you already have a copy, fetch upstream changes
+Adhere to the ambient style. When the style is not 100% consistent, use
+these guidelines to disambiguate:
 
-    ```
-    git fetch upstream master
-    ```
+* 2 spaces for indentation, do not use tabs
+* 80 character line length
+* No `using namespace` in headers; avoid `using namespace` at globle scope
+* `UpperCaseFirst` for classes
+* `camelCase` for functions and methods
+* `underscore_separated` local variables
+* `camelTrailingUnderscore_` member variables, no underscore in Thrift structs.
+* One class per `.h/.cpp` file, with the filename equal to the class name.
+* All control-flow statements have `{}` curly braces, with the opening brace
+  on the same line
+* Multi-line function signatures: each argument on its own line, indented 4
+  spaces. Prefer a blank line after the open brace.
+* Function docblocks should use this style: `/**\n * docs\n */`
+* Most inline comments use `// comment`
 
-1. Create a feature branch to work in
+## License
 
-    ```
-    git checkout -b feature-xxx remotes/upstream/master
-    ```
+By contributing to Bistro, you agree that your contributions will be
+licensed under its [LICENSE](LICENSE).
 
-1. _Before submitting a pull request_ periodically rebase your changes
-    (but don't do it when a pull request is already submitted)
-
-    ```
-    git pull --rebase upstream master
-    ```
-
-1. Before submitting a pull request, combine ("squash") related commits into a single one
-
-    ```
-    git rebase -i upstream/master
-    ```
-
-    This will open your editor and allow you to re-order commits and merge them:
-    - Re-order the lines to change commit order (to the extent possible without creating conflicts)
-    - Prefix commits using `s` (squash) or `f` (fixup) to merge extraneous commits.
-
-1. Submit a pull-request
-
-    ```
-    git push origin feature-xxx
-    ```
-
-    Go to your Druid fork main page
-
-    ```
-    https://github.com/<username>/incubator-druid
-    ```
-
-    If you recently pushed your changes GitHub will automatically pop up a
-    `Compare & pull request` button for any branches you recently pushed to. If you
-    click that button it will automatically offer you to submit your pull-request
-    to the apache/incubator-druid repository.
-
-    - Give your pull-request a meaningful title.
-    - In the description, explain your changes and the problem they are solving.
-
-1. Addressing code review comments
-
-    Address code review comments by committing changes and pushing them to your feature
-    branch.
-
-    ```
-    git push origin feature-xxx
-    ```
-
-### If your pull request shows conflicts with master
-  If your pull request shows conflicts with master, merge master into your feature branch:
-  
-
-  ```
-  git merge upstream/master
-  ```
-  
-  and resolve the conflicts. After resolving conflicts, push your branch again:
-  
-  ```
-  git push origin feature-xxx
-  ```
-
-  _Avoid rebasing and force pushes after submitting a pull request,_ since these make it
-  difficult for reviewers to see what you've changed in response to their reviews. The Druid
-  committer that merges your change will rebase and squash it into a single commit before
-  committing it to master.
-
-## FAQ
-
-### Help! I merged changes from upstream and cannot figure out how to resolve conflicts when rebasing!
-
-Never fear! If you occasionally merged upstream/master, here is another way to squash your changes into a single commit:
-
-1. First, rename your existing branch to something else, e.g. `feature-xxx-unclean`
-
-  ```
-  git branch -m feature-xxx-unclean
-  ```
-
-1. Checkout a new branch with the original name `feature-xxx` from upstream. This branch will supercede our old one.
-
-  ```
-  git checkout -b feature-xxx upstream/master
-  ```
-
-1. Then merge your changes in your original feature branch `feature-xxx-unclean` and create a single commit.
-
-  ```
-  git merge --squash feature-xxx-unclean
-  git commit
-  ```
-
-1. You can now submit this new branch and create or replace your existing pull request.
-
-  ```
-  git push origin [--force] feature-xxx:feature-xxx
-  ```
