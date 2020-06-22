@@ -81,7 +81,7 @@ public class JobHelper
   private static final int NUM_RETRIES = 8;
   private static final int SECONDS_BETWEEN_RETRIES = 2;
   private static final int DEFAULT_FS_BUFFER_SIZE = 1 << 18; // 256KB
-  private static final Pattern SNAPSHOT_JAR = Pattern.compile(".*\\-SNAPSHOT(-selfcontained)?\\.jar$");
+  private static final Pattern SNAPSHOT_JAR = Pattern.compile(".*-SNAPSHOT(-selfcontained)?\\.jar$");
 
   public static Path distributedClassPath(String path)
   {
@@ -103,8 +103,8 @@ public class JobHelper
    */
   public static void authenticate(HadoopDruidIndexerConfig config)
   {
-    String principal = config.HADOOP_KERBEROS_CONFIG.getPrincipal();
-    String keytab = config.HADOOP_KERBEROS_CONFIG.getKeytab();
+    String principal = HadoopDruidIndexerConfig.HADOOP_KERBEROS_CONFIG.getPrincipal();
+    String keytab = HadoopDruidIndexerConfig.HADOOP_KERBEROS_CONFIG.getKeytab();
     if (!Strings.isNullOrEmpty(principal) && !Strings.isNullOrEmpty(keytab)) {
       Configuration conf = new Configuration();
       UserGroupInformation.setConfiguration(conf);
@@ -180,7 +180,7 @@ public class JobHelper
     }
   }
 
-  public static final Predicate<Throwable> shouldRetryPredicate()
+  public static Predicate<Throwable> shouldRetryPredicate()
   {
     return new Predicate<Throwable>()
     {
@@ -315,11 +315,21 @@ public class JobHelper
     String mapJavaOpts = StringUtils.nullToEmptyNonDruidDataString(configuration.get(MRJobConfig.MAP_JAVA_OPTS));
     String reduceJavaOpts = StringUtils.nullToEmptyNonDruidDataString(configuration.get(MRJobConfig.REDUCE_JAVA_OPTS));
 
-    for (String propName : System.getProperties().stringPropertyNames()) {
+    for (String propName : HadoopDruidIndexerConfig.PROPERTIES.stringPropertyNames()) {
       for (String prefix : listOfAllowedPrefix) {
         if (propName.equals(prefix) || propName.startsWith(prefix + ".")) {
-          mapJavaOpts = StringUtils.format("%s -D%s=%s", mapJavaOpts, propName, System.getProperty(propName));
-          reduceJavaOpts = StringUtils.format("%s -D%s=%s", reduceJavaOpts, propName, System.getProperty(propName));
+          mapJavaOpts = StringUtils.format(
+              "%s -D%s=%s",
+              mapJavaOpts,
+              propName,
+              HadoopDruidIndexerConfig.PROPERTIES.getProperty(propName)
+          );
+          reduceJavaOpts = StringUtils.format(
+              "%s -D%s=%s",
+              reduceJavaOpts,
+              propName,
+              HadoopDruidIndexerConfig.PROPERTIES.getProperty(propName)
+          );
           break;
         }
       }
@@ -335,9 +345,9 @@ public class JobHelper
 
   public static Configuration injectSystemProperties(Configuration conf)
   {
-    for (String propName : System.getProperties().stringPropertyNames()) {
+    for (String propName : HadoopDruidIndexerConfig.PROPERTIES.stringPropertyNames()) {
       if (propName.startsWith("hadoop.")) {
-        conf.set(propName.substring("hadoop.".length()), System.getProperty(propName));
+        conf.set(propName.substring("hadoop.".length()), HadoopDruidIndexerConfig.PROPERTIES.getProperty(propName));
       }
     }
     return conf;

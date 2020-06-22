@@ -19,6 +19,7 @@
 
 package org.apache.druid.indexer.partitions;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 
@@ -40,6 +41,9 @@ public interface PartitionsSpec
   String MAX_ROWS_PER_SEGMENT = "maxRowsPerSegment";
   int HISTORICAL_NULL = -1;
 
+  @JsonIgnore
+  SecondaryPartitionType getType();
+
   /**
    * Returns the max number of rows per segment.
    * Implementations can have different default values which it could be even null.
@@ -53,6 +57,31 @@ public interface PartitionsSpec
    * It should usually return true if perfect rollup is enforced but number of partitions is not specified.
    */
   boolean needsDeterminePartitions(boolean useForHadoopTask);
+
+  /**
+   * @return True if this partitionSpec's type is compatible with forceGuaranteedRollup=true.
+   */
+  @JsonIgnore
+  default boolean isForceGuaranteedRollupCompatibleType()
+  {
+    return !(this instanceof DynamicPartitionsSpec);
+  }
+
+  /**
+   * @return True if this partitionSpec's property values are compatible with forceGuaranteedRollup=true.
+   */
+  @JsonIgnore
+  default boolean isForceGuaranteedRollupCompatible()
+  {
+    return getForceGuaranteedRollupIncompatiblityReason().isEmpty();
+  }
+
+  /**
+   * @return Message describing why this partitionSpec is incompatible with forceGuaranteedRollup=true. Empty string if
+   * the partitionSpec is compatible.
+   */
+  @JsonIgnore
+  String getForceGuaranteedRollupIncompatiblityReason();
 
   /**
    * '-1' regarded as null for some historical reason.

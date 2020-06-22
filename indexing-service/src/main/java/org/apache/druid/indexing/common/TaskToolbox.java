@@ -42,6 +42,7 @@ import org.apache.druid.java.util.metrics.MonitorScheduler;
 import org.apache.druid.query.QueryRunnerFactoryConglomerate;
 import org.apache.druid.segment.IndexIO;
 import org.apache.druid.segment.IndexMergerV9;
+import org.apache.druid.segment.join.JoinableFactory;
 import org.apache.druid.segment.loading.DataSegmentArchiver;
 import org.apache.druid.segment.loading.DataSegmentKiller;
 import org.apache.druid.segment.loading.DataSegmentMover;
@@ -86,8 +87,9 @@ public class TaskToolbox
   private final Provider<QueryRunnerFactoryConglomerate> queryRunnerFactoryConglomerateProvider;
   private final MonitorScheduler monitorScheduler;
   private final ExecutorService queryExecutorService;
+  private final JoinableFactory joinableFactory;
   private final SegmentLoader segmentLoader;
-  private final ObjectMapper objectMapper;
+  private final ObjectMapper jsonMapper;
   private final File taskWorkDir;
   private final IndexIO indexIO;
   private final Cache cache;
@@ -116,9 +118,10 @@ public class TaskToolbox
       SegmentHandoffNotifierFactory handoffNotifierFactory,
       Provider<QueryRunnerFactoryConglomerate> queryRunnerFactoryConglomerateProvider,
       ExecutorService queryExecutorService,
+      JoinableFactory joinableFactory,
       MonitorScheduler monitorScheduler,
       SegmentLoader segmentLoader,
-      ObjectMapper objectMapper,
+      ObjectMapper jsonMapper,
       File taskWorkDir,
       IndexIO indexIO,
       Cache cache,
@@ -146,9 +149,10 @@ public class TaskToolbox
     this.handoffNotifierFactory = handoffNotifierFactory;
     this.queryRunnerFactoryConglomerateProvider = queryRunnerFactoryConglomerateProvider;
     this.queryExecutorService = queryExecutorService;
+    this.joinableFactory = joinableFactory;
     this.monitorScheduler = monitorScheduler;
     this.segmentLoader = segmentLoader;
-    this.objectMapper = objectMapper;
+    this.jsonMapper = jsonMapper;
     this.taskWorkDir = taskWorkDir;
     this.indexIO = Preconditions.checkNotNull(indexIO, "Null IndexIO");
     this.cache = cache;
@@ -160,7 +164,7 @@ public class TaskToolbox
     this.lookupNodeService = lookupNodeService;
     this.dataNodeService = dataNodeService;
     this.taskReportFileWriter = taskReportFileWriter;
-    this.taskReportFileWriter.setObjectMapper(this.objectMapper);
+    this.taskReportFileWriter.setObjectMapper(this.jsonMapper);
     this.intermediaryDataManager = intermediaryDataManager;
   }
 
@@ -229,14 +233,19 @@ public class TaskToolbox
     return queryExecutorService;
   }
 
+  public JoinableFactory getJoinableFactory()
+  {
+    return joinableFactory;
+  }
+
   public MonitorScheduler getMonitorScheduler()
   {
     return monitorScheduler;
   }
 
-  public ObjectMapper getObjectMapper()
+  public ObjectMapper getJsonMapper()
   {
-    return objectMapper;
+    return jsonMapper;
   }
 
   public Map<DataSegment, File> fetchSegments(List<DataSegment> segments)
@@ -294,9 +303,9 @@ public class TaskToolbox
     return indexMergerV9;
   }
 
-  public File getFirehoseTemporaryDir()
+  public File getIndexingTmpDir()
   {
-    return new File(taskWorkDir, "firehose");
+    return new File(taskWorkDir, "indexing-tmp");
   }
 
   public File getMergeDir()

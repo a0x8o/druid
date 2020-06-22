@@ -22,29 +22,40 @@ package org.apache.druid.indexing.common.task;
 import com.fasterxml.jackson.annotation.JacksonInject;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonInclude.Include;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonTypeName;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
-import com.google.common.collect.Lists;
+import com.google.common.collect.ImmutableList;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
 import com.google.common.util.concurrent.ListenableFuture;
-import org.apache.druid.data.input.Firehose;
+import org.apache.druid.data.input.FiniteFirehoseFactory;
 import org.apache.druid.data.input.FirehoseFactory;
+import org.apache.druid.data.input.FirehoseFactoryToInputSourceAdaptor;
+import org.apache.druid.data.input.InputFormat;
 import org.apache.druid.data.input.InputRow;
+import org.apache.druid.data.input.InputRowSchema;
+import org.apache.druid.data.input.InputSource;
+import org.apache.druid.data.input.InputSourceReader;
 import org.apache.druid.data.input.Rows;
+import org.apache.druid.data.input.impl.InputRowParser;
+import org.apache.druid.data.input.impl.ParseSpec;
 import org.apache.druid.hll.HyperLogLogCollector;
+import org.apache.druid.indexer.Checks;
 import org.apache.druid.indexer.IngestionState;
+import org.apache.druid.indexer.Property;
 import org.apache.druid.indexer.TaskStatus;
 import org.apache.druid.indexer.partitions.DynamicPartitionsSpec;
 import org.apache.druid.indexer.partitions.HashedPartitionsSpec;
 import org.apache.druid.indexer.partitions.PartitionsSpec;
+import org.apache.druid.indexer.partitions.SecondaryPartitionType;
 import org.apache.druid.indexing.common.IngestionStatsAndErrorsTaskReport;
 import org.apache.druid.indexing.common.IngestionStatsAndErrorsTaskReportData;
-import org.apache.druid.indexing.common.LockGranularity;
 import org.apache.druid.indexing.common.TaskRealtimeMetricsMonitorBuilder;
 import org.apache.druid.indexing.common.TaskReport;
 import org.apache.druid.indexing.common.TaskToolbox;
@@ -53,18 +64,28 @@ import org.apache.druid.indexing.common.actions.TaskActionClient;
 import org.apache.druid.indexing.common.stats.RowIngestionMeters;
 import org.apache.druid.indexing.common.stats.RowIngestionMetersFactory;
 import org.apache.druid.indexing.common.stats.TaskRealtimeMetricsMonitor;
+import org.apache.druid.indexing.common.task.batch.parallel.PartialHashSegmentGenerateTask;
+import org.apache.druid.indexing.common.task.batch.parallel.iterator.DefaultIndexTaskInputRowIteratorBuilder;
+import org.apache.druid.indexing.common.task.batch.partition.CompletePartitionAnalysis;
+import org.apache.druid.indexing.common.task.batch.partition.HashPartitionAnalysis;
+import org.apache.druid.indexing.common.task.batch.partition.LinearPartitionAnalysis;
+import org.apache.druid.indexing.common.task.batch.partition.PartitionAnalysis;
+import org.apache.druid.indexing.overlord.sampler.InputSourceSampler;
+import org.apache.druid.java.util.common.IAE;
 import org.apache.druid.java.util.common.ISE;
 import org.apache.druid.java.util.common.Intervals;
 import org.apache.druid.java.util.common.JodaUtils;
-import org.apache.druid.java.util.common.Pair;
 import org.apache.druid.java.util.common.StringUtils;
+import org.apache.druid.java.util.common.UOE;
 import org.apache.druid.java.util.common.granularity.Granularity;
 import org.apache.druid.java.util.common.guava.Comparators;
 import org.apache.druid.java.util.common.logger.Logger;
+import org.apache.druid.java.util.common.parsers.CloseableIterator;
 import org.apache.druid.java.util.common.parsers.ParseException;
+import org.apache.druid.query.aggregation.AggregatorFactory;
 import org.apache.druid.segment.IndexSpec;
+import org.apache.druid.segment.indexing.BatchIOConfig;
 import org.apache.druid.segment.indexing.DataSchema;
-import org.apache.druid.segment.indexing.IOConfig;
 import org.apache.druid.segment.indexing.IngestionSpec;
 import org.apache.druid.segment.indexing.RealtimeIOConfig;
 import org.apache.druid.segment.indexing.TuningConfig;
@@ -77,7 +98,8 @@ import org.apache.druid.segment.realtime.appenderator.AppenderatorConfig;
 import org.apache.druid.segment.realtime.appenderator.AppenderatorsManager;
 import org.apache.druid.segment.realtime.appenderator.BaseAppenderatorDriver;
 import org.apache.druid.segment.realtime.appenderator.BatchAppenderatorDriver;
-import org.apache.druid.segment.realtime.appenderator.SegmentsAndMetadata;
+import org.apache.druid.segment.realtime.appenderator.SegmentAllocator;
+import org.apache.druid.segment.realtime.appenderator.SegmentsAndCommitMetadata;
 import org.apache.druid.segment.realtime.appenderator.TransactionalSegmentPublisher;
 import org.apache.druid.segment.realtime.firehose.ChatHandler;
 import org.apache.druid.segment.realtime.firehose.ChatHandlerProvider;
@@ -88,12 +110,12 @@ import org.apache.druid.timeline.DataSegment;
 import org.apache.druid.timeline.partition.HashBasedNumberedShardSpec;
 import org.apache.druid.timeline.partition.NumberedShardSpec;
 import org.apache.druid.timeline.partition.ShardSpec;
-import org.apache.druid.timeline.partition.ShardSpecFactory;
 import org.apache.druid.utils.CircularBuffer;
 import org.codehaus.plexus.util.FileUtils;
 import org.joda.time.Interval;
 import org.joda.time.Period;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.GET;
@@ -106,16 +128,19 @@ import javax.ws.rs.core.Response;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
 {
@@ -237,12 +262,6 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
   }
 
   @Override
-  public int getPriority()
-  {
-    return getContextValue(Tasks.PRIORITY_KEY, Tasks.DEFAULT_BATCH_INDEX_TASK_PRIORITY);
-  }
-
-  @Override
   public String getType()
   {
     return TYPE;
@@ -251,6 +270,13 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
   @Override
   public boolean isReady(TaskActionClient taskActionClient) throws Exception
   {
+    final IndexTuningConfig tuningConfig = getIngestionSchema().getTuningConfig();
+    if (tuningConfig != null && tuningConfig.getPartitionsSpec() != null) {
+      if (tuningConfig.getPartitionsSpec().getType() != SecondaryPartitionType.LINEAR
+          && tuningConfig.getPartitionsSpec().getType() != SecondaryPartitionType.HASH) {
+        throw new UOE("partitionsSpec[%s] is not supported", tuningConfig.getPartitionsSpec().getClass().getName());
+      }
+    }
     return determineLockGranularityAndTryLock(taskActionClient, ingestionSchema.dataSchema.getGranularitySpec());
   }
 
@@ -441,7 +467,7 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
   {
     try {
       if (chatHandlerProvider.isPresent()) {
-        log.info("Found chat handler of class[%s]", chatHandlerProvider.get().getClass().getName());
+        log.debug("Found chat handler of class[%s]", chatHandlerProvider.get().getClass().getName());
 
         if (chatHandlerProvider.get().get(getId()).isPresent()) {
           // This is a workaround for ParallelIndexSupervisorTask to avoid double registering when it runs in the
@@ -461,24 +487,26 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
                                                          .bucketIntervals()
                                                          .isPresent();
 
-      final FirehoseFactory firehoseFactory = ingestionSchema.getIOConfig().getFirehoseFactory();
+      final InputSource inputSource = ingestionSchema.getIOConfig().getNonNullInputSource(
+          ingestionSchema.getDataSchema().getParser()
+      );
 
-      final File firehoseTempDir = toolbox.getFirehoseTemporaryDir();
-      // Firehose temporary directory is automatically removed when this IndexTask completes.
-      FileUtils.forceMkdir(firehoseTempDir);
+      final File tmpDir = toolbox.getIndexingTmpDir();
+      // Temporary directory is automatically removed when this IndexTask completes.
+      FileUtils.forceMkdir(tmpDir);
 
       ingestionState = IngestionState.DETERMINE_PARTITIONS;
 
       // Initialize maxRowsPerSegment and maxTotalRows lazily
       final IndexTuningConfig tuningConfig = ingestionSchema.tuningConfig;
       final PartitionsSpec partitionsSpec = tuningConfig.getGivenOrDefaultPartitionsSpec();
-      final Map<Interval, Pair<ShardSpecFactory, Integer>> allocateSpec = determineShardSpecs(
+      final PartitionAnalysis partitionAnalysis = determineShardSpecs(
           toolbox,
-          firehoseFactory,
-          firehoseTempDir,
+          inputSource,
+          tmpDir,
           partitionsSpec
       );
-      final List<Interval> allocateIntervals = new ArrayList<>(allocateSpec.keySet());
+      final List<Interval> allocateIntervals = new ArrayList<>(partitionAnalysis.getAllIntervalsToIndex());
       final DataSchema dataSchema;
       if (determineIntervals) {
         if (!determineLockGranularityandTryLock(toolbox.getTaskActionClient(), allocateIntervals)) {
@@ -493,14 +521,14 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
       } else {
         dataSchema = ingestionSchema.getDataSchema();
       }
+
       ingestionState = IngestionState.BUILD_SEGMENTS;
       return generateAndPublishSegments(
           toolbox,
           dataSchema,
-          allocateSpec,
-          firehoseFactory,
-          firehoseTempDir,
-          partitionsSpec
+          inputSource,
+          tmpDir,
+          partitionAnalysis
       );
     }
     catch (Exception e) {
@@ -583,16 +611,14 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
    *
    * @return a map indicating how many shardSpecs need to be created per interval.
    */
-  private Map<Interval, Pair<ShardSpecFactory, Integer>> determineShardSpecs(
+  private PartitionAnalysis determineShardSpecs(
       final TaskToolbox toolbox,
-      final FirehoseFactory firehoseFactory,
-      final File firehoseTempDir,
-      final PartitionsSpec nonNullPartitionsSpec
+      final InputSource inputSource,
+      final File tmpDir,
+      @Nonnull final PartitionsSpec partitionsSpec
   ) throws IOException
   {
-    final ObjectMapper jsonMapper = toolbox.getObjectMapper();
-    final IndexTuningConfig tuningConfig = ingestionSchema.getTuningConfig();
-    final IndexIOConfig ioConfig = ingestionSchema.getIOConfig();
+    final ObjectMapper jsonMapper = toolbox.getJsonMapper();
 
     final GranularitySpec granularitySpec = ingestionSchema.getDataSchema().getGranularitySpec();
 
@@ -600,103 +626,119 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     final boolean determineIntervals = !granularitySpec.bucketIntervals().isPresent();
 
     // Must determine partitions if rollup is guaranteed and the user didn't provide a specific value.
-    final boolean determineNumPartitions = nonNullPartitionsSpec.needsDeterminePartitions(false);
+    final boolean determineNumPartitions = partitionsSpec.needsDeterminePartitions(false);
 
     // if we were given number of shards per interval and the intervals, we don't need to scan the data
     if (!determineNumPartitions && !determineIntervals) {
       log.info("Skipping determine partition scan");
-      return createShardSpecWithoutInputScan(
-          granularitySpec,
-          ioConfig,
-          tuningConfig,
-          nonNullPartitionsSpec
-      );
+      if (partitionsSpec.getType() == SecondaryPartitionType.HASH) {
+        return PartialHashSegmentGenerateTask.createHashPartitionAnalysisFromPartitionsSpec(
+            granularitySpec,
+            (HashedPartitionsSpec) partitionsSpec
+        );
+      } else if (partitionsSpec.getType() == SecondaryPartitionType.LINEAR) {
+        return createLinearPartitionAnalysis(granularitySpec, (DynamicPartitionsSpec) partitionsSpec);
+      } else {
+        throw new UOE("%s", partitionsSpec.getClass().getName());
+      }
     } else {
       // determine intervals containing data and prime HLL collectors
+      log.info("Determining intervals and shardSpecs");
       return createShardSpecsFromInput(
           jsonMapper,
           ingestionSchema,
-          firehoseFactory,
-          firehoseTempDir,
+          inputSource,
+          tmpDir,
           granularitySpec,
-          nonNullPartitionsSpec,
+          partitionsSpec,
           determineIntervals
       );
     }
   }
 
-  private Map<Interval, Pair<ShardSpecFactory, Integer>> createShardSpecsFromInput(
+  private static LinearPartitionAnalysis createLinearPartitionAnalysis(
+      GranularitySpec granularitySpec,
+      @Nonnull DynamicPartitionsSpec partitionsSpec
+  )
+  {
+    final SortedSet<Interval> intervals = granularitySpec.bucketIntervals().get();
+    final int numBucketsPerInterval = 1;
+    final LinearPartitionAnalysis partitionAnalysis = new LinearPartitionAnalysis(partitionsSpec);
+    intervals.forEach(interval -> partitionAnalysis.updateBucket(interval, numBucketsPerInterval));
+    return partitionAnalysis;
+  }
+
+  private PartitionAnalysis createShardSpecsFromInput(
       ObjectMapper jsonMapper,
       IndexIngestionSpec ingestionSchema,
-      FirehoseFactory firehoseFactory,
-      File firehoseTempDir,
+      InputSource inputSource,
+      File tmpDir,
       GranularitySpec granularitySpec,
-      PartitionsSpec nonNullPartitionsSpec,
+      @Nonnull PartitionsSpec partitionsSpec,
       boolean determineIntervals
   ) throws IOException
   {
-    log.info("Determining intervals and shardSpecs");
+    assert partitionsSpec.getType() != SecondaryPartitionType.RANGE;
     long determineShardSpecsStartMillis = System.currentTimeMillis();
 
     final Map<Interval, Optional<HyperLogLogCollector>> hllCollectors = collectIntervalsAndShardSpecs(
         jsonMapper,
         ingestionSchema,
-        firehoseFactory,
-        firehoseTempDir,
+        inputSource,
+        tmpDir,
         granularitySpec,
-        nonNullPartitionsSpec,
+        partitionsSpec,
         determineIntervals
     );
-
-    final Map<Interval, Pair<ShardSpecFactory, Integer>> allocateSpecs = new HashMap<>();
+    final PartitionAnalysis<Integer, ?> partitionAnalysis;
+    if (partitionsSpec.getType() == SecondaryPartitionType.LINEAR) {
+      partitionAnalysis = new LinearPartitionAnalysis((DynamicPartitionsSpec) partitionsSpec);
+    } else if (partitionsSpec.getType() == SecondaryPartitionType.HASH) {
+      partitionAnalysis = new HashPartitionAnalysis((HashedPartitionsSpec) partitionsSpec);
+    } else {
+      throw new UOE("%s", partitionsSpec.getClass().getName());
+    }
     for (final Map.Entry<Interval, Optional<HyperLogLogCollector>> entry : hllCollectors.entrySet()) {
       final Interval interval = entry.getKey();
-
-      if (isGuaranteedRollup(ingestionSchema.getIOConfig(), ingestionSchema.getTuningConfig())) {
-        assert nonNullPartitionsSpec instanceof HashedPartitionsSpec;
-        final HashedPartitionsSpec partitionsSpec = (HashedPartitionsSpec) nonNullPartitionsSpec;
-
+      final int numBucketsPerInterval;
+      if (partitionsSpec.getType() == SecondaryPartitionType.HASH) {
+        final HashedPartitionsSpec hashedPartitionsSpec = (HashedPartitionsSpec) partitionsSpec;
         final HyperLogLogCollector collector = entry.getValue().orNull();
 
-        final int numShards;
         if (partitionsSpec.needsDeterminePartitions(false)) {
           final long numRows = Preconditions.checkNotNull(collector, "HLL collector").estimateCardinalityRound();
           final int nonNullMaxRowsPerSegment = partitionsSpec.getMaxRowsPerSegment() == null
                                                ? PartitionsSpec.DEFAULT_MAX_ROWS_PER_SEGMENT
                                                : partitionsSpec.getMaxRowsPerSegment();
-          numShards = (int) Math.ceil((double) numRows / nonNullMaxRowsPerSegment);
+          numBucketsPerInterval = (int) Math.ceil((double) numRows / nonNullMaxRowsPerSegment);
           log.info(
               "Estimated [%,d] rows of data for interval [%s], creating [%,d] shards",
               numRows,
               interval,
-              numShards
+              numBucketsPerInterval
           );
         } else {
-          numShards = partitionsSpec.getNumShards() == null ? 1 : partitionsSpec.getNumShards();
-          log.info("Creating [%,d] shards for interval [%s]", numShards, interval);
+          numBucketsPerInterval = hashedPartitionsSpec.getNumShards() == null ? 1 : hashedPartitionsSpec.getNumShards();
+          log.info("Creating [%,d] buckets for interval [%s]", numBucketsPerInterval, interval);
         }
-
-        // Overwrite mode, guaranteed rollup: shardSpecs must be known in advance.
-        allocateSpecs.put(
-            interval,
-            createShardSpecFactoryForGuaranteedRollup(numShards, partitionsSpec.getPartitionDimensions())
-        );
       } else {
-        allocateSpecs.put(interval, null);
+        numBucketsPerInterval = 1;
       }
+
+      partitionAnalysis.updateBucket(interval, numBucketsPerInterval);
     }
     log.info("Found intervals and shardSpecs in %,dms", System.currentTimeMillis() - determineShardSpecsStartMillis);
 
-    return allocateSpecs;
+    return partitionAnalysis;
   }
 
   private Map<Interval, Optional<HyperLogLogCollector>> collectIntervalsAndShardSpecs(
       ObjectMapper jsonMapper,
       IndexIngestionSpec ingestionSchema,
-      FirehoseFactory firehoseFactory,
-      File firehoseTempDir,
+      InputSource inputSource,
+      File tmpDir,
       GranularitySpec granularitySpec,
-      PartitionsSpec nonNullPartitionsSpec,
+      @Nonnull PartitionsSpec partitionsSpec,
       boolean determineIntervals
   ) throws IOException
   {
@@ -704,14 +746,25 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
         Comparators.intervalsByStartThenEnd()
     );
     final Granularity queryGranularity = granularitySpec.getQueryGranularity();
+    final List<String> metricsNames = Arrays.stream(ingestionSchema.getDataSchema().getAggregators())
+                                            .map(AggregatorFactory::getName)
+                                            .collect(Collectors.toList());
+    final InputSourceReader inputSourceReader = ingestionSchema.getDataSchema().getTransformSpec().decorate(
+        inputSource.reader(
+            new InputRowSchema(
+                ingestionSchema.getDataSchema().getTimestampSpec(),
+                ingestionSchema.getDataSchema().getDimensionsSpec(),
+                metricsNames
+            ),
+            inputSource.needsFormat() ? getInputFormat(ingestionSchema) : null,
+            tmpDir
+        )
+    );
 
-    try (
-        final Firehose firehose = firehoseFactory.connect(ingestionSchema.getDataSchema().getParser(), firehoseTempDir)
-    ) {
-
-      while (firehose.hasMore()) {
+    try (final CloseableIterator<InputRow> inputRowIterator = inputSourceReader.read()) {
+      while (inputRowIterator.hasNext()) {
         try {
-          final InputRow inputRow = firehose.nextRow();
+          final InputRow inputRow = inputRowIterator.next();
 
           // The null inputRow means the caller must skip this row.
           if (inputRow == null) {
@@ -739,7 +792,7 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
             interval = optInterval.get();
           }
 
-          if (nonNullPartitionsSpec.needsDeterminePartitions(false)) {
+          if (partitionsSpec.needsDeterminePartitions(false)) {
             hllCollectors.computeIfAbsent(interval, intv -> Optional.of(HyperLogLogCollector.makeLatestCollector()));
 
             List<Object> groupKey = Rows.toGroupKey(
@@ -757,7 +810,7 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
         }
         catch (ParseException e) {
           if (ingestionSchema.getTuningConfig().isLogParseExceptions()) {
-            log.error(e, "Encountered parse exception: ");
+            log.error(e, "Encountered parse exception");
           }
 
           if (determinePartitionsSavedParseExceptions != null) {
@@ -783,32 +836,6 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     return hllCollectors;
   }
 
-  private IndexTaskSegmentAllocator createSegmentAllocator(
-      TaskToolbox toolbox,
-      DataSchema dataSchema,
-      Map<Interval, Pair<ShardSpecFactory, Integer>> allocateSpec
-  ) throws IOException
-  {
-    if (ingestionSchema.ioConfig.isAppendToExisting() || isUseSegmentLock()) {
-      return new RemoteSegmentAllocator(
-          toolbox,
-          getId(),
-          dataSchema,
-          getSegmentLockHelper(),
-          isUseSegmentLock() ? LockGranularity.SEGMENT : LockGranularity.TIME_CHUNK,
-          ingestionSchema.ioConfig.isAppendToExisting()
-      );
-    } else {
-      // We use the timeChunk lock and don't have to ask the overlord to create segmentIds.
-      // Instead, a local allocator is used.
-      if (isGuaranteedRollup(ingestionSchema.ioConfig, ingestionSchema.tuningConfig)) {
-        return new CachingLocalSegmentAllocator(toolbox, getId(), getDataSource(), allocateSpec);
-      } else {
-        return new LocalSegmentAllocator(toolbox, getId(), getDataSource(), dataSchema.getGranularitySpec());
-      }
-    }
-  }
-
   /**
    * This method reads input data row by row and adds the read row to a proper segment using {@link BaseAppenderatorDriver}.
    * If there is no segment for the row, a new one is created.  Segments can be published in the middle of reading inputs
@@ -830,10 +857,9 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
   private TaskStatus generateAndPublishSegments(
       final TaskToolbox toolbox,
       final DataSchema dataSchema,
-      final Map<Interval, Pair<ShardSpecFactory, Integer>> allocateSpec,
-      final FirehoseFactory firehoseFactory,
-      final File firehoseTempDir,
-      final PartitionsSpec partitionsSpec
+      final InputSource inputSource,
+      final File tmpDir,
+      final PartitionAnalysis partitionAnalysis
   ) throws IOException, InterruptedException
   {
     final FireDepartment fireDepartmentForMetrics =
@@ -849,14 +875,42 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
       toolbox.getMonitorScheduler().addMonitor(metricsMonitor);
     }
 
+    final PartitionsSpec partitionsSpec = partitionAnalysis.getPartitionsSpec();
     final IndexTuningConfig tuningConfig = ingestionSchema.getTuningConfig();
     final long pushTimeout = tuningConfig.getPushTimeout();
 
-    final IndexTaskSegmentAllocator segmentAllocator = createSegmentAllocator(
-        toolbox,
-        dataSchema,
-        allocateSpec
-    );
+    final SegmentAllocator segmentAllocator;
+    final SequenceNameFunction sequenceNameFunction;
+    switch (partitionsSpec.getType()) {
+      case HASH:
+      case RANGE:
+        final CachingSegmentAllocator localSegmentAllocator = SegmentAllocators.forNonLinearPartitioning(
+            toolbox,
+            getDataSource(),
+            getId(),
+            null,
+            (CompletePartitionAnalysis) partitionAnalysis
+        );
+        sequenceNameFunction = new NonLinearlyPartitionedSequenceNameFunction(
+            getId(),
+            localSegmentAllocator.getShardSpecs()
+        );
+        segmentAllocator = localSegmentAllocator;
+        break;
+      case LINEAR:
+        segmentAllocator = SegmentAllocators.forLinearPartitioning(
+            toolbox,
+            null,
+            dataSchema,
+            getTaskLockHelper(),
+            ingestionSchema.getIOConfig().isAppendToExisting(),
+            partitionAnalysis.getPartitionsSpec()
+        );
+        sequenceNameFunction = new LinearlyPartitionedSequenceNameFunction(getId());
+        break;
+      default:
+        throw new UOE("[%s] secondary partition type is not supported", partitionsSpec.getType());
+    }
 
     final TransactionalSegmentPublisher publisher = (segmentsToBeOverwritten, segmentsToPublish, commitMetadata) ->
         toolbox.getTaskActionClient()
@@ -880,29 +934,32 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     try (final BatchAppenderatorDriver driver = BatchAppenderators.newDriver(appenderator, toolbox, segmentAllocator)) {
       driver.startJob();
 
-      final FiniteFirehoseProcessor firehoseProcessor = new FiniteFirehoseProcessor(
+      final InputSourceProcessor inputSourceProcessor = new InputSourceProcessor(
           buildSegmentsMeters,
           buildSegmentsSavedParseExceptions,
           tuningConfig.isLogParseExceptions(),
           tuningConfig.getMaxParseExceptions(),
-          pushTimeout
+          pushTimeout,
+          new DefaultIndexTaskInputRowIteratorBuilder()
       );
-      firehoseProcessor.process(
+      inputSourceProcessor.process(
           dataSchema,
           driver,
           partitionsSpec,
-          firehoseFactory,
-          firehoseTempDir,
-          segmentAllocator
+          inputSource,
+          inputSource.needsFormat() ? getInputFormat(ingestionSchema) : null,
+          tmpDir,
+          sequenceNameFunction
       );
 
       // If we use timeChunk lock, then we don't have to specify what segments will be overwritten because
       // it will just overwrite all segments overlapped with the new segments.
-      final Set<DataSegment> inputSegments = isUseSegmentLock()
-                                             ? getSegmentLockHelper().getLockedExistingSegments()
+      final Set<DataSegment> inputSegments = getTaskLockHelper().isUseSegmentLock()
+                                             ? getTaskLockHelper().getLockedExistingSegments()
                                              : null;
       // Probably we can publish atomicUpdateGroup along with segments.
-      final SegmentsAndMetadata published = awaitPublish(driver.publishAll(inputSegments, publisher), pushTimeout);
+      final SegmentsAndCommitMetadata published =
+          awaitPublish(driver.publishAll(inputSegments, publisher), pushTimeout);
       appenderator.close();
 
       ingestionState = IngestionState.COMPLETED;
@@ -921,7 +978,8 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
             buildSegmentsMeters.getUnparseable(),
             buildSegmentsMeters.getThrownAway()
         );
-        log.info("Published segments: %s", Lists.transform(published.getSegments(), DataSegment::getId));
+        log.info("Published [%s] segments", published.getSegments().size());
+        log.debugSegments(published.getSegments(), "Published segments");
 
         toolbox.getTaskReportFileWriter().write(getId(), getTaskCompletionReports());
         return TaskStatus.success(getId());
@@ -944,8 +1002,8 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     }
   }
 
-  private static SegmentsAndMetadata awaitPublish(
-      ListenableFuture<SegmentsAndMetadata> publishFuture,
+  private static SegmentsAndCommitMetadata awaitPublish(
+      ListenableFuture<SegmentsAndCommitMetadata> publishFuture,
       long publishTimeout
   ) throws ExecutionException, InterruptedException, TimeoutException
   {
@@ -969,25 +1027,11 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     }
 
     /**
-     * Return the underlying map.
-     *
-     * @return a map of intervals to shardSpecs
-     */
-    Map<Interval, List<ShardSpec>> getMap()
-    {
-      return map;
-    }
-
-    Set<Interval> getIntervals()
-    {
-      return map.keySet();
-    }
-
-    /**
      * Return a shardSpec for the given interval and input row.
      *
      * @param interval interval for shardSpec
      * @param row      input row
+     *
      * @return a shardSpec
      */
     ShardSpec getShardSpec(Interval interval, InputRow row)
@@ -998,6 +1042,14 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
       }
       return shardSpecs.get(0).getLookup(shardSpecs).getShardSpec(row.getTimestampFromEpoch(), row);
     }
+  }
+
+  private static InputFormat getInputFormat(IndexIngestionSpec ingestionSchema)
+  {
+    final InputRowParser parser = ingestionSchema.getDataSchema().getParser();
+    return ingestionSchema.getIOConfig().getNonNullInputFormat(
+        parser == null ? null : parser.getParseSpec()
+    );
   }
 
   public static class IndexIngestionSpec extends IngestionSpec<IndexIOConfig, IndexTuningConfig>
@@ -1014,6 +1066,18 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     )
     {
       super(dataSchema, ioConfig, tuningConfig);
+
+      if (dataSchema.getParserMap() != null && ioConfig.getInputSource() != null) {
+        throw new IAE("Cannot use parser and inputSource together. Try using inputFormat instead of parser.");
+      }
+      if (ioConfig.getInputSource() != null && ioConfig.getInputSource().needsFormat()) {
+        Checks.checkOneNotNullOrEmpty(
+            ImmutableList.of(
+                new Property<>("parser", dataSchema.getParserMap()),
+                new Property<>("inputFormat", ioConfig.getInputFormat())
+            )
+        );
+      }
 
       this.dataSchema = dataSchema;
       this.ioConfig = ioConfig;
@@ -1043,37 +1107,100 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
   }
 
   @JsonTypeName("index")
-  public static class IndexIOConfig implements IOConfig
+  public static class IndexIOConfig implements BatchIOConfig
   {
     private static final boolean DEFAULT_APPEND_TO_EXISTING = false;
 
     private final FirehoseFactory firehoseFactory;
+    private final InputSource inputSource;
+    private final InputFormat inputFormat;
     private final boolean appendToExisting;
 
     @JsonCreator
     public IndexIOConfig(
-        @JsonProperty("firehose") FirehoseFactory firehoseFactory,
+        @Deprecated @JsonProperty("firehose") @Nullable FirehoseFactory firehoseFactory,
+        @JsonProperty("inputSource") @Nullable InputSource inputSource,
+        @JsonProperty("inputFormat") @Nullable InputFormat inputFormat,
         @JsonProperty("appendToExisting") @Nullable Boolean appendToExisting
     )
     {
+      Checks.checkOneNotNullOrEmpty(
+          ImmutableList.of(new Property<>("firehose", firehoseFactory), new Property<>("inputSource", inputSource))
+      );
+      if (firehoseFactory != null && inputFormat != null) {
+        throw new IAE("Cannot use firehose and inputFormat together. Try using inputSource instead of firehose.");
+      }
       this.firehoseFactory = firehoseFactory;
+      this.inputSource = inputSource;
+      this.inputFormat = inputFormat;
       this.appendToExisting = appendToExisting == null ? DEFAULT_APPEND_TO_EXISTING : appendToExisting;
     }
 
+    // old constructor for backward compatibility
+    @Deprecated
+    public IndexIOConfig(FirehoseFactory firehoseFactory, @Nullable Boolean appendToExisting)
+    {
+      this(firehoseFactory, null, null, appendToExisting);
+    }
+
+    @Nullable
     @JsonProperty("firehose")
+    @JsonInclude(Include.NON_NULL)
+    @Deprecated
     public FirehoseFactory getFirehoseFactory()
     {
       return firehoseFactory;
     }
 
-    @JsonProperty("appendToExisting")
+    @Nullable
+    @Override
+    @JsonProperty
+    public InputSource getInputSource()
+    {
+      return inputSource;
+    }
+
+    /**
+     * Returns {@link InputFormat}. Can be null if {@link DataSchema#parserMap} is specified.
+     * Also can be null in {@link InputSourceSampler}.
+     */
+    @Nullable
+    @Override
+    @JsonProperty
+    public InputFormat getInputFormat()
+    {
+      return inputFormat;
+    }
+
+    public InputSource getNonNullInputSource(@Nullable InputRowParser inputRowParser)
+    {
+      if (inputSource == null) {
+        return new FirehoseFactoryToInputSourceAdaptor(
+            (FiniteFirehoseFactory) firehoseFactory,
+            inputRowParser
+        );
+      } else {
+        return inputSource;
+      }
+    }
+
+    public InputFormat getNonNullInputFormat(@Nullable ParseSpec parseSpec)
+    {
+      if (inputFormat == null) {
+        return Preconditions.checkNotNull(parseSpec, "parseSpec").toInputFormat();
+      } else {
+        return inputFormat;
+      }
+    }
+
+    @Override
+    @JsonProperty
     public boolean isAppendToExisting()
     {
       return appendToExisting;
     }
   }
 
-  @JsonTypeName("index")
   public static class IndexTuningConfig implements TuningConfig, AppenderatorConfig
   {
     private static final IndexSpec DEFAULT_INDEX_SPEC = new IndexSpec();
@@ -1109,11 +1236,6 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
     @Nullable
     private final SegmentWriteOutMediumFactory segmentWriteOutMediumFactory;
 
-    public static IndexTuningConfig createDefault()
-    {
-      return new IndexTuningConfig();
-    }
-
     @Nullable
     private static PartitionsSpec getDefaultPartitionsSpec(
         boolean forceGuaranteedRollup,
@@ -1142,8 +1264,8 @@ public class IndexTask extends AbstractBatchIndexTask implements ChatHandler
         }
       } else {
         if (forceGuaranteedRollup) {
-          if (!(partitionsSpec instanceof HashedPartitionsSpec)) {
-            throw new ISE("HashedPartitionsSpec must be used for perfect rollup");
+          if (!partitionsSpec.isForceGuaranteedRollupCompatibleType()) {
+            throw new ISE(partitionsSpec.getClass().getSimpleName() + " cannot be used for perfect rollup");
           }
         } else {
           if (!(partitionsSpec instanceof DynamicPartitionsSpec)) {

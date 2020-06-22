@@ -21,7 +21,7 @@ package org.apache.druid.storage.azure;
 
 import com.google.common.io.ByteSource;
 import com.google.inject.Inject;
-import org.apache.commons.io.FileUtils;
+import org.apache.druid.java.util.common.FileUtils;
 import org.apache.druid.java.util.common.logger.Logger;
 import org.apache.druid.segment.loading.SegmentLoadingException;
 import org.apache.druid.utils.CompressionUtils;
@@ -29,6 +29,9 @@ import org.apache.druid.utils.CompressionUtils;
 import java.io.File;
 import java.io.IOException;
 
+/**
+ * Used for Reading segment files stored in Azure based deep storage
+ */
 public class AzureDataSegmentPuller
 {
   private static final Logger log = new Logger(AzureDataSegmentPuller.class);
@@ -40,17 +43,16 @@ public class AzureDataSegmentPuller
   
   static final String AZURE_STORAGE_HOST_ADDRESS = "blob.core.windows.net";
 
-  private final AzureStorage azureStorage;
+  private final AzureByteSourceFactory byteSourceFactory;
 
   @Inject
   public AzureDataSegmentPuller(
-      AzureStorage azureStorage
-  )
+      AzureByteSourceFactory byteSourceFactory)
   {
-    this.azureStorage = azureStorage;
+    this.byteSourceFactory = byteSourceFactory;
   }
 
-  org.apache.druid.java.util.common.FileUtils.FileCopyResult getSegmentFiles(
+  FileUtils.FileCopyResult getSegmentFiles(
       final String containerName,
       final String blobPath,
       final File outDir
@@ -58,24 +60,16 @@ public class AzureDataSegmentPuller
       throws SegmentLoadingException
   {
     try {
-      FileUtils.forceMkdir(outDir);
+      org.apache.commons.io.FileUtils.forceMkdir(outDir);
 
       log.info(
           "Loading container: [%s], with blobPath: [%s] and outDir: [%s]", containerName, blobPath, outDir
       );
 
-      boolean blobPathIsHadoop = blobPath.contains(AZURE_STORAGE_HOST_ADDRESS);
-      final String actualBlobPath;
-      if (blobPathIsHadoop) {
-        // Remove azure's hadoop prefix to match realtime ingestion path
-        actualBlobPath = blobPath.substring(
-            blobPath.indexOf(AZURE_STORAGE_HOST_ADDRESS) + AZURE_STORAGE_HOST_ADDRESS.length() + 1);
-      } else {
-        actualBlobPath = blobPath;
-      }
+      final String actualBlobPath = AzureUtils.maybeRemoveAzurePathPrefix(blobPath);
 
-      final ByteSource byteSource = new AzureByteSource(azureStorage, containerName, actualBlobPath);
-      final org.apache.druid.java.util.common.FileUtils.FileCopyResult result = CompressionUtils.unzip(
+      final ByteSource byteSource = byteSourceFactory.create(containerName, actualBlobPath);
+      final FileUtils.FileCopyResult result = CompressionUtils.unzip(
           byteSource,
           outDir,
           AzureUtils.AZURE_RETRY,

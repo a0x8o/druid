@@ -41,7 +41,6 @@ import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.java.util.common.ISE;
 import org.apache.druid.java.util.common.StringUtils;
 import org.apache.druid.java.util.common.concurrent.Execs;
-import org.apache.druid.java.util.common.concurrent.ScheduledExecutors;
 import org.apache.druid.java.util.common.guava.Sequence;
 import org.apache.druid.java.util.common.guava.Yielder;
 import org.apache.druid.java.util.common.guava.Yielders;
@@ -95,8 +94,6 @@ public class DruidSchema extends AbstractSchema
       .reversed()
       .thenComparing(Function.identity());
 
-  public static final String NAME = "druid";
-
   private static final EmittingLogger log = new EmittingLogger(DruidSchema.class);
   private static final int MAX_SEGMENTS_PER_QUERY = 15000;
   private static final long DEFAULT_NUM_ROWS = 0;
@@ -149,7 +146,7 @@ public class DruidSchema extends AbstractSchema
     Preconditions.checkNotNull(serverView, "serverView");
     this.config = Preconditions.checkNotNull(config, "config");
     this.viewManager = Preconditions.checkNotNull(viewManager, "viewManager");
-    this.cacheExec = ScheduledExecutors.fixed(1, "DruidSchema-Cache-%d");
+    this.cacheExec = Execs.singleThreaded("DruidSchema-Cache-%d");
     this.tables = new ConcurrentHashMap<>();
     this.escalator = escalator;
 
@@ -274,13 +271,9 @@ public class DruidSchema extends AbstractSchema
                     final DruidTable druidTable = buildDruidTable(dataSource);
                     final DruidTable oldTable = tables.put(dataSource, druidTable);
                     if (oldTable == null || !oldTable.getRowSignature().equals(druidTable.getRowSignature())) {
-                      log.debug(
-                          "Table for dataSource[%s] has new signature[%s].",
-                          dataSource,
-                          druidTable.getRowSignature()
-                      );
+                      log.info("dataSource [%s] has new signature: %s.", dataSource, druidTable.getRowSignature());
                     } else {
-                      log.debug("Table for dataSource[%s] signature is unchanged.", dataSource);
+                      log.debug("dataSource [%s] signature is unchanged.", dataSource);
                     }
                   }
 
@@ -320,10 +313,10 @@ public class DruidSchema extends AbstractSchema
     );
 
     if (config.isAwaitInitializationOnStart()) {
-      final long startMillis = System.currentTimeMillis();
-      log.info("%s waiting for initialization.", getClass().getSimpleName());
+      final long startNanos = System.nanoTime();
+      log.debug("%s waiting for initialization.", getClass().getSimpleName());
       awaitInitialization();
-      log.info("%s initialized in [%,d] ms.", getClass().getSimpleName(), System.currentTimeMillis() - startMillis);
+      log.info("%s initialized in [%,d] ms.", getClass().getSimpleName(), (System.nanoTime() - startNanos) / 1000000);
     }
   }
 
@@ -425,7 +418,7 @@ public class DruidSchema extends AbstractSchema
       if (dataSourceSegments.isEmpty()) {
         segmentMetadataInfo.remove(segment.getDataSource());
         tables.remove(segment.getDataSource());
-        log.info("Removed all metadata for dataSource[%s].", segment.getDataSource());
+        log.info("dataSource[%s] no longer exists, all metadata removed.", segment.getDataSource());
       }
 
       lock.notifyAll();
@@ -542,10 +535,7 @@ public class DruidSchema extends AbstractSchema
             } else {
               final AvailableSegmentMetadata segmentMetadata = dataSourceSegments.get(segmentId);
               if (segmentMetadata == null) {
-                log.warn(
-                    "No segment[%s] found, skipping refresh",
-                    segmentId
-                );
+                log.warn("No segment[%s] found, skipping refresh", segmentId);
               } else {
                 final AvailableSegmentMetadata updatedSegmentMetadata = AvailableSegmentMetadata
                     .from(segmentMetadata)
@@ -567,7 +557,7 @@ public class DruidSchema extends AbstractSchema
       yielder.close();
     }
 
-    log.info(
+    log.debug(
         "Refreshed metadata for dataSource[%s] in %,d ms (%d segments queried, %d segments left).",
         dataSource,
         System.currentTimeMillis() - startTime,

@@ -28,12 +28,8 @@
     <parent>
         <groupId>org.apache.druid</groupId>
         <artifactId>druid</artifactId>
-        <version>0.17.0-incubating-SNAPSHOT</version>
+        <version>0.18.0-SNAPSHOT</version>
     </parent>
-
-    <properties>
-        <apache.kafka.version>2.1.0</apache.kafka.version>
-    </properties>
 
     <dependencies>
         <dependency>
@@ -183,6 +179,10 @@
             <artifactId>log4j-slf4j-impl</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <dependency>
+            <groupId>com.google.code.findbugs</groupId>
+            <artifactId>jsr305</artifactId>
+        </dependency>
 
         <!-- Tests -->
         <dependency>
@@ -252,12 +252,22 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.owasp</groupId>
+                <artifactId>dependency-check-maven</artifactId>
+                <configuration>
+                    <skip>true</skip>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 
     <profiles>
         <profile>
             <id>integration-tests</id>
+            <properties>
+                <jvm.runtime>8</jvm.runtime>
+            </properties>
             <build>
                 <plugins>
                     <plugin>
@@ -271,7 +281,7 @@
                                 </goals>
                                 <phase>pre-integration-test</phase>
                                 <configuration>
-                                    <executable>${project.basedir}/run_cluster.sh</executable>
+                                    <executable>${project.basedir}/run_cluster_using_java_runtime_${jvm.runtime}.sh</executable>
                                 </configuration>
                             </execution>
                             <execution>

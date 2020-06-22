@@ -54,6 +54,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BiPredicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * OvershadowableManager manages the state of {@link AtomicUpdateGroup}. See the below {@link State} for details.
@@ -88,14 +89,19 @@ class OvershadowableManager<T extends Overshadowable<T>>
 
   // (start partitionId, end partitionId) -> minorVersion -> atomicUpdateGroup
   private final TreeMap<RootPartitionRange, Short2ObjectSortedMap<AtomicUpdateGroup<T>>> standbyGroups;
-  private final TreeMap<RootPartitionRange, Short2ObjectSortedMap<AtomicUpdateGroup<T>>> visibleGroup;
+  /**
+   * The values in this map must always be {@link SingleEntryShort2ObjectSortedMap}, hence there is at most one visible
+   * group per range. The same type is used as in {@link #standbyGroups} and {@link #overshadowedGroups} to reuse helper
+   * functions across all {@link State}s.
+   */
+  private final TreeMap<RootPartitionRange, Short2ObjectSortedMap<AtomicUpdateGroup<T>>> visibleGroupPerRange;
   private final TreeMap<RootPartitionRange, Short2ObjectSortedMap<AtomicUpdateGroup<T>>> overshadowedGroups;
 
   OvershadowableManager()
   {
     this.knownPartitionChunks = new HashMap<>();
     this.standbyGroups = new TreeMap<>();
-    this.visibleGroup = new TreeMap<>();
+    this.visibleGroupPerRange = new TreeMap<>();
     this.overshadowedGroups = new TreeMap<>();
   }
 
@@ -103,7 +109,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
   {
     this.knownPartitionChunks = new HashMap<>(other.knownPartitionChunks);
     this.standbyGroups = new TreeMap<>(other.standbyGroups);
-    this.visibleGroup = new TreeMap<>(other.visibleGroup);
+    this.visibleGroupPerRange = new TreeMap<>(other.visibleGroupPerRange);
     this.overshadowedGroups = new TreeMap<>(other.overshadowedGroups);
   }
 
@@ -123,7 +129,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
       case STANDBY:
         return standbyGroups;
       case VISIBLE:
-        return visibleGroup;
+        return visibleGroupPerRange;
       case OVERSHADOWED:
         return overshadowedGroups;
       default:
@@ -669,7 +675,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
           final AtomicUpdateGroup<T> newAtomicUpdateGroup = new AtomicUpdateGroup<>(chunk);
 
           // Decide the initial state of the new atomicUpdateGroup
-          final boolean overshadowed = visibleGroup
+          final boolean overshadowed = visibleGroupPerRange
               .values()
               .stream()
               .flatMap(map -> map.values().stream())
@@ -785,7 +791,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
     }
 
     final List<AtomicUpdateGroup<T>> visibles = new ArrayList<>();
-    for (Short2ObjectSortedMap<AtomicUpdateGroup<T>> map : manager.visibleGroup.values()) {
+    for (Short2ObjectSortedMap<AtomicUpdateGroup<T>> map : manager.visibleGroupPerRange.values()) {
       visibles.addAll(map.values());
     }
     return visibles;
@@ -807,7 +813,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
 
     final OvershadowableManager<T> manager = new OvershadowableManager<>(overshadowedGroups);
     final List<AtomicUpdateGroup<T>> visibles = new ArrayList<>();
-    for (Short2ObjectSortedMap<AtomicUpdateGroup<T>> map : manager.visibleGroup.values()) {
+    for (Short2ObjectSortedMap<AtomicUpdateGroup<T>> map : manager.visibleGroupPerRange.values()) {
       for (AtomicUpdateGroup<T> atomicUpdateGroup : map.values()) {
         if (!atomicUpdateGroup.isFull()) {
           return Collections.emptyList();
@@ -885,12 +891,15 @@ class OvershadowableManager<T extends Overshadowable<T>>
 
   public boolean isEmpty()
   {
-    return visibleGroup.isEmpty();
+    return visibleGroupPerRange.isEmpty();
   }
 
   public boolean isComplete()
   {
-    return visibleGroup.values().stream().allMatch(map -> Iterables.getOnlyElement(map.values()).isFull());
+    return visibleGroupPerRange
+        .values()
+        .stream()
+        .allMatch(map -> Iterables.getOnlyElement(map.values()).isFull());
   }
 
   @Nullable
@@ -913,9 +922,13 @@ class OvershadowableManager<T extends Overshadowable<T>>
     }
   }
 
-  List<PartitionChunk<T>> getVisibleChunks()
+  Stream<PartitionChunk<T>> createVisibleChunksStream()
   {
-    return getAllChunks(visibleGroup);
+    return visibleGroupPerRange
+        .values()
+        .stream()
+        .flatMap((Short2ObjectSortedMap<AtomicUpdateGroup<T>> map) -> map.values().stream())
+        .flatMap((AtomicUpdateGroup<T> aug) -> aug.getChunks().stream());
   }
 
   List<PartitionChunk<T>> getOvershadowedChunks()
@@ -929,7 +942,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
     return getAllChunks(standbyGroups);
   }
 
-  private List<PartitionChunk<T>> getAllChunks(
+  private static <T extends Overshadowable<T>> List<PartitionChunk<T>> getAllChunks(
       TreeMap<RootPartitionRange, Short2ObjectSortedMap<AtomicUpdateGroup<T>>> stateMap
   )
   {
@@ -954,14 +967,14 @@ class OvershadowableManager<T extends Overshadowable<T>>
     OvershadowableManager<?> that = (OvershadowableManager<?>) o;
     return Objects.equals(knownPartitionChunks, that.knownPartitionChunks) &&
            Objects.equals(standbyGroups, that.standbyGroups) &&
-           Objects.equals(visibleGroup, that.visibleGroup) &&
+           Objects.equals(visibleGroupPerRange, that.visibleGroupPerRange) &&
            Objects.equals(overshadowedGroups, that.overshadowedGroups);
   }
 
   @Override
   public int hashCode()
   {
-    return Objects.hash(knownPartitionChunks, standbyGroups, visibleGroup, overshadowedGroups);
+    return Objects.hash(knownPartitionChunks, standbyGroups, visibleGroupPerRange, overshadowedGroups);
   }
 
   @Override
@@ -970,7 +983,7 @@ class OvershadowableManager<T extends Overshadowable<T>>
     return "OvershadowableManager{" +
            "knownPartitionChunks=" + knownPartitionChunks +
            ", standbyGroups=" + standbyGroups +
-           ", visibleGroup=" + visibleGroup +
+           ", visibleGroupPerRangePerVersion=" + visibleGroupPerRange +
            ", overshadowedGroups=" + overshadowedGroups +
            '}';
   }

@@ -25,6 +25,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Optional;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Supplier;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
@@ -37,7 +38,7 @@ import org.apache.druid.data.input.FirehoseFactory;
 import org.apache.druid.data.input.InputRow;
 import org.apache.druid.discovery.DiscoveryDruidNode;
 import org.apache.druid.discovery.LookupNodeService;
-import org.apache.druid.discovery.NodeType;
+import org.apache.druid.discovery.NodeRole;
 import org.apache.druid.indexer.IngestionState;
 import org.apache.druid.indexer.TaskStatus;
 import org.apache.druid.indexer.partitions.DynamicPartitionsSpec;
@@ -78,7 +79,7 @@ import org.apache.druid.segment.realtime.FireDepartmentMetrics;
 import org.apache.druid.segment.realtime.appenderator.Appenderator;
 import org.apache.druid.segment.realtime.appenderator.AppenderatorDriverAddResult;
 import org.apache.druid.segment.realtime.appenderator.AppenderatorsManager;
-import org.apache.druid.segment.realtime.appenderator.SegmentsAndMetadata;
+import org.apache.druid.segment.realtime.appenderator.SegmentsAndCommitMetadata;
 import org.apache.druid.segment.realtime.appenderator.StreamAppenderatorDriver;
 import org.apache.druid.segment.realtime.appenderator.TransactionalSegmentPublisher;
 import org.apache.druid.segment.realtime.firehose.ChatHandler;
@@ -89,7 +90,7 @@ import org.apache.druid.segment.realtime.firehose.TimedShutoffFirehoseFactory;
 import org.apache.druid.segment.realtime.plumber.Committers;
 import org.apache.druid.server.security.Action;
 import org.apache.druid.server.security.AuthorizerMapper;
-import org.apache.druid.timeline.partition.NumberedShardSpecFactory;
+import org.apache.druid.timeline.partition.NumberedPartialShardSpec;
 import org.apache.druid.utils.CircularBuffer;
 
 import javax.servlet.http.HttpServletRequest;
@@ -135,7 +136,7 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
   private final RealtimeAppenderatorIngestionSpec spec;
 
   @JsonIgnore
-  private final Queue<ListenableFuture<SegmentsAndMetadata>> pendingHandoffs;
+  private final Queue<ListenableFuture<SegmentsAndCommitMetadata>> pendingHandoffs;
 
   @JsonIgnore
   private volatile Appenderator appenderator = null;
@@ -273,7 +274,7 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
     this.metrics = fireDepartmentForMetrics.getMetrics();
 
     final Supplier<Committer> committerSupplier = Committers.nilSupplier();
-    final File firehoseTempDir = toolbox.getFirehoseTemporaryDir();
+    final File firehoseTempDir = toolbox.getIndexingTmpDir();
 
     DiscoveryDruidNode discoveryDruidNode = createDiscoveryDruidNode(toolbox);
 
@@ -350,7 +351,10 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
       // Skip connecting firehose if we've been stopped before we got started.
       synchronized (this) {
         if (!gracefullyStopped) {
-          firehose = firehoseFactory.connect(spec.getDataSchema().getParser(), firehoseTempDir);
+          firehose = firehoseFactory.connect(
+              Preconditions.checkNotNull(spec.getDataSchema().getParser(), "inputRowParser"),
+              firehoseTempDir
+          );
         }
       }
 
@@ -630,7 +634,7 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
     }
 
     if (spec.getTuningConfig().isLogParseExceptions()) {
-      log.error(pe, "Encountered parse exception: ");
+      log.error(pe, "Encountered parse exception");
     }
 
     if (savedParseExceptions != null) {
@@ -673,7 +677,7 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
       String sequenceName
   )
   {
-    final ListenableFuture<SegmentsAndMetadata> publishFuture = driver.publish(
+    final ListenableFuture<SegmentsAndCommitMetadata> publishFuture = driver.publish(
         publisher,
         committerSupplier.get(),
         Collections.singletonList(sequenceName)
@@ -740,7 +744,7 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
                                           new LookupNodeService(getContextValue(CTX_KEY_LOOKUP_TIER));
     return new DiscoveryDruidNode(
         toolbox.getDruidNode(),
-        NodeType.PEON,
+        NodeRole.PEON,
         ImmutableMap.of(
             toolbox.getDataNodeService().getName(), toolbox.getDataNodeService(),
             lookupNodeService.getName(), lookupNodeService
@@ -761,13 +765,14 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
         tuningConfig.withBasePersistDirectory(toolbox.getPersistDir()),
         metrics,
         toolbox.getSegmentPusher(),
-        toolbox.getObjectMapper(),
+        toolbox.getJsonMapper(),
         toolbox.getIndexIO(),
         toolbox.getIndexMergerV9(),
         toolbox.getQueryRunnerFactoryConglomerate(),
         toolbox.getSegmentAnnouncer(),
         toolbox.getEmitter(),
         toolbox.getQueryExecutorService(),
+        toolbox.getJoinableFactory(),
         toolbox.getCache(),
         toolbox.getCacheConfig(),
         toolbox.getCachePopulatorStats()
@@ -794,14 +799,14 @@ public class AppenderatorDriverRealtimeIndexTask extends AbstractTask implements
                 sequenceName,
                 previousSegmentId,
                 skipSegmentLineageCheck,
-                NumberedShardSpecFactory.instance(),
+                NumberedPartialShardSpec.instance(),
                 LockGranularity.TIME_CHUNK
             )
         ),
         toolbox.getSegmentHandoffNotifierFactory(),
         new ActionBasedUsedSegmentChecker(toolbox.getTaskActionClient()),
         toolbox.getDataSegmentKiller(),
-        toolbox.getObjectMapper(),
+        toolbox.getJsonMapper(),
         metrics
     );
   }
