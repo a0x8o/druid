@@ -39,6 +39,8 @@ import org.apache.druid.segment.writeout.SegmentWriteOutMediumFactory;
 import org.apache.druid.timeline.DataSegment.PruneSpecsHolder;
 import org.junit.Assert;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -60,17 +62,13 @@ public class TestHelper
 
   public static IndexIO getTestIndexIO()
   {
-    return new IndexIO(
-        JSON_MAPPER,
-        new ColumnConfig()
-        {
-          @Override
-          public int columnCacheSizeBytes()
-          {
-            return 0;
-          }
-        }
-    );
+    ColumnConfig noCacheColumnConfig = () -> 0;
+    return getTestIndexIO(noCacheColumnConfig);
+  }
+
+  public static IndexIO getTestIndexIO(ColumnConfig columnConfig)
+  {
+    return new IndexIO(JSON_MAPPER, columnConfig);
   }
 
   public static ObjectMapper makeJsonMapper()
@@ -388,5 +386,22 @@ public class TestHelper
       theVals.put(vals[i].toString(), vals[i + 1]);
     }
     return theVals;
+  }
+
+  public static void testSerializesDeserializes(Object object)
+  {
+    testSerializesDeserializes(JSON_MAPPER, object);
+  }
+
+  public static void testSerializesDeserializes(ObjectMapper objectMapper, Object object)
+  {
+    try {
+      String serialized = objectMapper.writeValueAsString(object);
+      Object deserialized = objectMapper.readValue(serialized, object.getClass());
+      Assert.assertEquals(serialized, objectMapper.writeValueAsString(deserialized));
+    }
+    catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 }

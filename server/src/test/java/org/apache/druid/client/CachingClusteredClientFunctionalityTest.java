@@ -38,7 +38,7 @@ import org.apache.druid.java.util.common.Intervals;
 import org.apache.druid.java.util.common.Pair;
 import org.apache.druid.java.util.common.guava.Sequence;
 import org.apache.druid.java.util.common.io.Closer;
-import org.apache.druid.query.DataSource;
+import org.apache.druid.query.DruidProcessingConfig;
 import org.apache.druid.query.Druids;
 import org.apache.druid.query.Query;
 import org.apache.druid.query.QueryPlus;
@@ -46,8 +46,10 @@ import org.apache.druid.query.QueryRunner;
 import org.apache.druid.query.QueryToolChestWarehouse;
 import org.apache.druid.query.aggregation.CountAggregatorFactory;
 import org.apache.druid.query.context.ResponseContext;
+import org.apache.druid.query.planning.DataSourceAnalysis;
 import org.apache.druid.server.coordination.ServerType;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.TimelineLookup;
 import org.apache.druid.timeline.VersionedIntervalTimeline;
 import org.apache.druid.timeline.partition.NoneShardSpec;
 import org.apache.druid.timeline.partition.SingleElementPartitionChunk;
@@ -63,10 +65,13 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 
 /**
+ *
  */
 public class CachingClusteredClientFunctionalityTest
 {
@@ -181,6 +186,7 @@ public class CachingClusteredClientFunctionalityTest
                        .interval(interval)
                        .version(version)
                        .shardSpec(NoneShardSpec.instance())
+                       .size(0)
                        .build(),
             new TierSelectorStrategy()
             {
@@ -242,9 +248,9 @@ public class CachingClusteredClientFunctionalityTest
           }
 
           @Override
-          public VersionedIntervalTimeline<String, ServerSelector> getTimeline(DataSource dataSource)
+          public Optional<? extends TimelineLookup<String, ServerSelector>> getTimeline(DataSourceAnalysis analysis)
           {
-            return timeline;
+            return Optional.of(timeline);
           }
 
           @Nullable
@@ -301,13 +307,30 @@ public class CachingClusteredClientFunctionalityTest
             return mergeLimit;
           }
         },
-        new DruidHttpClientConfig() {
+        new DruidHttpClientConfig()
+        {
           @Override
           public long getMaxQueuedBytes()
           {
             return 0L;
           }
-        }
+        },
+        new DruidProcessingConfig()
+        {
+          @Override
+          public String getFormatString()
+          {
+            return null;
+          }
+
+          @Override
+          public int getMergePoolParallelism()
+          {
+            // fixed so same behavior across all test environments
+            return 4;
+          }
+        },
+        ForkJoinPool.commonPool()
     );
   }
 

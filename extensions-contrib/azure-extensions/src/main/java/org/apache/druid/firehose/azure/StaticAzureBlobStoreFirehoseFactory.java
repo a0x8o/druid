@@ -28,6 +28,7 @@ import org.apache.druid.data.input.FiniteFirehoseFactory;
 import org.apache.druid.data.input.InputSplit;
 import org.apache.druid.data.input.impl.StringInputRowParser;
 import org.apache.druid.data.input.impl.prefetch.PrefetchableTextFilesFirehoseFactory;
+import org.apache.druid.java.util.common.StringUtils;
 import org.apache.druid.storage.azure.AzureByteSource;
 import org.apache.druid.storage.azure.AzureStorage;
 import org.apache.druid.storage.azure.AzureUtils;
@@ -42,7 +43,11 @@ import java.util.Objects;
 
 /**
  * This class is heavily inspired by the StaticS3FirehoseFactory class in the org.apache.druid.firehose.s3 package
+ *
+ * @deprecated as of version 0.18.0 because support for firehose has been discontinued. Please use
+ * {@link org.apache.druid.data.input.azure.AzureInputSource} instead.
  */
+@Deprecated
 public class StaticAzureBlobStoreFirehoseFactory extends PrefetchableTextFilesFirehoseFactory<AzureBlob>
 {
   private final AzureStorage azureStorage;
@@ -50,7 +55,7 @@ public class StaticAzureBlobStoreFirehoseFactory extends PrefetchableTextFilesFi
 
   @JsonCreator
   public StaticAzureBlobStoreFirehoseFactory(
-      @JacksonInject("azureStorage") AzureStorage azureStorage,
+      @JacksonInject AzureStorage azureStorage,
       @JsonProperty("blobs") List<AzureBlob> blobs,
       @JsonProperty("maxCacheCapacityBytes") Long maxCacheCapacityBytes,
       @JsonProperty("maxFetchCapacityBytes") Long maxFetchCapacityBytes,
@@ -101,9 +106,7 @@ public class StaticAzureBlobStoreFirehoseFactory extends PrefetchableTextFilesFi
   private static AzureByteSource makeByteSource(AzureStorage azureStorage, AzureBlob object)
   {
     final String container = object.getContainer();
-    final String path = object.getPath().startsWith("/")
-                        ? object.getPath().substring(1)
-                        : object.getPath();
+    final String path = StringUtils.maybeRemoveLeadingSlash(object.getPath());
 
     return new AzureByteSource(azureStorage, container, path);
   }

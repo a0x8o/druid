@@ -41,6 +41,7 @@ import org.apache.druid.segment.realtime.FireDepartmentMetrics;
 import org.apache.druid.segment.realtime.appenderator.SegmentWithState.SegmentState;
 import org.apache.druid.segment.realtime.plumber.SegmentHandoffNotifier;
 import org.apache.druid.segment.realtime.plumber.SegmentHandoffNotifierFactory;
+import org.apache.druid.timeline.DataSegment;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
@@ -115,8 +116,6 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
         appenderator.startJob(),
         AppenderatorDriverMetadata.class
     );
-
-    log.info("Restored metadata[%s].", metadata);
 
     if (metadata != null) {
       synchronized (segments) {
@@ -227,10 +226,10 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
   public Object persist(final Committer committer) throws InterruptedException
   {
     try {
-      log.info("Persisting data.");
+      log.debug("Persisting pending data.");
       final long start = System.currentTimeMillis();
       final Object commitMetadata = appenderator.persistAll(wrapCommitter(committer)).get();
-      log.info("Persisted pending data in %,dms.", System.currentTimeMillis() - start);
+      log.debug("Persisted pending data in %,dms.", System.currentTimeMillis() - start);
       return commitMetadata;
     }
     catch (InterruptedException e) {
@@ -266,7 +265,7 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
    * @return a {@link ListenableFuture} for the submitted task which removes published {@code sequenceNames} from
    * {@code activeSegments} and {@code publishPendingSegments}
    */
-  public ListenableFuture<SegmentsAndMetadata> publish(
+  public ListenableFuture<SegmentsAndCommitMetadata> publish(
       final TransactionalSegmentPublisher publisher,
       final Committer committer,
       final Collection<String> sequenceNames
@@ -276,7 +275,7 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
         .map(SegmentWithState::getSegmentIdentifier)
         .collect(Collectors.toList());
 
-    final ListenableFuture<SegmentsAndMetadata> publishFuture = ListenableFutures.transformAsync(
+    final ListenableFuture<SegmentsAndCommitMetadata> publishFuture = ListenableFutures.transformAsync(
         // useUniquePath=true prevents inconsistencies in segment data when task failures or replicas leads to a second
         // version of a segment with the same identifier containing different data; see DataSegmentPusher.push() docs
         pushInBackground(wrapCommitter(committer), theSegments, true),
@@ -288,7 +287,7 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
     );
     return Futures.transform(
         publishFuture,
-        (Function<? super SegmentsAndMetadata, ? extends SegmentsAndMetadata>) sam -> {
+        (Function<? super SegmentsAndCommitMetadata, ? extends SegmentsAndCommitMetadata>) sam -> {
           synchronized (segments) {
             sequenceNames.forEach(segments::remove);
           }
@@ -298,40 +297,40 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
   }
 
   /**
-   * Register the segments in the given {@link SegmentsAndMetadata} to be handed off and execute a background task which
+   * Register the segments in the given {@link SegmentsAndCommitMetadata} to be handed off and execute a background task which
    * waits until the hand off completes.
    *
-   * @param segmentsAndMetadata the result segments and metadata of
+   * @param segmentsAndCommitMetadata the result segments and metadata of
    *                            {@link #publish(TransactionalSegmentPublisher, Committer, Collection)}
    *
    * @return null if the input segmentsAndMetadata is null. Otherwise, a {@link ListenableFuture} for the submitted task
-   * which returns {@link SegmentsAndMetadata} containing the segments successfully handed off and the metadata
+   * which returns {@link SegmentsAndCommitMetadata} containing the segments successfully handed off and the metadata
    * of the caller of {@link AppenderatorDriverMetadata}
    */
-  public ListenableFuture<SegmentsAndMetadata> registerHandoff(SegmentsAndMetadata segmentsAndMetadata)
+  public ListenableFuture<SegmentsAndCommitMetadata> registerHandoff(SegmentsAndCommitMetadata segmentsAndCommitMetadata)
   {
-    if (segmentsAndMetadata == null) {
+    if (segmentsAndCommitMetadata == null) {
       return Futures.immediateFuture(null);
 
     } else {
-      final List<SegmentIdWithShardSpec> waitingSegmentIdList = segmentsAndMetadata.getSegments().stream()
-                                                                                   .map(
+      final List<SegmentIdWithShardSpec> waitingSegmentIdList = segmentsAndCommitMetadata.getSegments().stream()
+                                                                                         .map(
                                                                                        SegmentIdWithShardSpec::fromDataSegment)
-                                                                                   .collect(Collectors.toList());
-      final Object metadata = Preconditions.checkNotNull(segmentsAndMetadata.getCommitMetadata(), "commitMetadata");
+                                                                                         .collect(Collectors.toList());
+      final Object metadata = Preconditions.checkNotNull(segmentsAndCommitMetadata.getCommitMetadata(), "commitMetadata");
 
       if (waitingSegmentIdList.isEmpty()) {
         return Futures.immediateFuture(
-            new SegmentsAndMetadata(
-                segmentsAndMetadata.getSegments(),
+            new SegmentsAndCommitMetadata(
+                segmentsAndCommitMetadata.getSegments(),
                 ((AppenderatorDriverMetadata) metadata).getCallerMetadata()
             )
         );
       }
 
-      log.info("Register handoff of segments: [%s]", waitingSegmentIdList);
+      log.debug("Register handoff of segments: [%s]", waitingSegmentIdList);
 
-      final SettableFuture<SegmentsAndMetadata> resultFuture = SettableFuture.create();
+      final SettableFuture<SegmentsAndCommitMetadata> resultFuture = SettableFuture.create();
       final AtomicInteger numRemainingHandoffSegments = new AtomicInteger(waitingSegmentIdList.size());
 
       for (final SegmentIdWithShardSpec segmentIdentifier : waitingSegmentIdList) {
@@ -343,7 +342,7 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
             ),
             Execs.directExecutor(),
             () -> {
-              log.info("Segment[%s] successfully handed off, dropping.", segmentIdentifier);
+              log.debug("Segment[%s] successfully handed off, dropping.", segmentIdentifier);
               metrics.incrementHandOffCount();
 
               final ListenableFuture<?> dropFuture = appenderator.drop(segmentIdentifier);
@@ -355,10 +354,11 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
                     public void onSuccess(Object result)
                     {
                       if (numRemainingHandoffSegments.decrementAndGet() == 0) {
-                        log.info("Successfully handed off [%d] segments.", segmentsAndMetadata.getSegments().size());
+                        List<DataSegment> segments = segmentsAndCommitMetadata.getSegments();
+                        log.debug("Successfully handed off [%d] segments.", segments.size());
                         resultFuture.set(
-                            new SegmentsAndMetadata(
-                                segmentsAndMetadata.getSegments(),
+                            new SegmentsAndCommitMetadata(
+                                segments,
                                 ((AppenderatorDriverMetadata) metadata).getCallerMetadata()
                             )
                         );
@@ -382,7 +382,7 @@ public class StreamAppenderatorDriver extends BaseAppenderatorDriver
     }
   }
 
-  public ListenableFuture<SegmentsAndMetadata> publishAndRegisterHandoff(
+  public ListenableFuture<SegmentsAndCommitMetadata> publishAndRegisterHandoff(
       final TransactionalSegmentPublisher publisher,
       final Committer committer,
       final Collection<String> sequenceNames

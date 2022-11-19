@@ -29,6 +29,7 @@ import org.apache.druid.client.cache.CachePopulatorStats;
 import org.apache.druid.discovery.DataNodeService;
 import org.apache.druid.discovery.DruidNodeAnnouncer;
 import org.apache.druid.discovery.LookupNodeService;
+import org.apache.druid.guice.annotations.Json;
 import org.apache.druid.guice.annotations.Parent;
 import org.apache.druid.guice.annotations.Processing;
 import org.apache.druid.guice.annotations.RemoteChatHandler;
@@ -41,6 +42,7 @@ import org.apache.druid.java.util.metrics.MonitorScheduler;
 import org.apache.druid.query.QueryRunnerFactoryConglomerate;
 import org.apache.druid.segment.IndexIO;
 import org.apache.druid.segment.IndexMergerV9;
+import org.apache.druid.segment.join.JoinableFactory;
 import org.apache.druid.segment.loading.DataSegmentArchiver;
 import org.apache.druid.segment.loading.DataSegmentKiller;
 import org.apache.druid.segment.loading.DataSegmentMover;
@@ -71,9 +73,10 @@ public class TaskToolboxFactory
   private final SegmentHandoffNotifierFactory handoffNotifierFactory;
   private final Provider<QueryRunnerFactoryConglomerate> queryRunnerFactoryConglomerateProvider;
   private final ExecutorService queryExecutorService;
+  private final JoinableFactory joinableFactory;
   private final MonitorScheduler monitorScheduler;
   private final SegmentLoaderFactory segmentLoaderFactory;
-  private final ObjectMapper objectMapper;
+  private final ObjectMapper jsonMapper;
   private final IndexIO indexIO;
   private final Cache cache;
   private final CacheConfig cacheConfig;
@@ -101,9 +104,10 @@ public class TaskToolboxFactory
       SegmentHandoffNotifierFactory handoffNotifierFactory,
       Provider<QueryRunnerFactoryConglomerate> queryRunnerFactoryConglomerateProvider,
       @Processing ExecutorService queryExecutorService,
+      JoinableFactory joinableFactory,
       MonitorScheduler monitorScheduler,
       SegmentLoaderFactory segmentLoaderFactory,
-      ObjectMapper objectMapper,
+      @Json ObjectMapper jsonMapper,
       IndexIO indexIO,
       Cache cache,
       CacheConfig cacheConfig,
@@ -130,9 +134,10 @@ public class TaskToolboxFactory
     this.handoffNotifierFactory = handoffNotifierFactory;
     this.queryRunnerFactoryConglomerateProvider = queryRunnerFactoryConglomerateProvider;
     this.queryExecutorService = queryExecutorService;
+    this.joinableFactory = joinableFactory;
     this.monitorScheduler = monitorScheduler;
     this.segmentLoaderFactory = segmentLoaderFactory;
-    this.objectMapper = objectMapper;
+    this.jsonMapper = jsonMapper;
     this.indexIO = Preconditions.checkNotNull(indexIO, "Null IndexIO");
     this.cache = cache;
     this.cacheConfig = cacheConfig;
@@ -163,9 +168,10 @@ public class TaskToolboxFactory
         handoffNotifierFactory,
         queryRunnerFactoryConglomerateProvider,
         queryExecutorService,
+        joinableFactory,
         monitorScheduler,
         segmentLoaderFactory.manufacturate(taskWorkDir),
-        objectMapper,
+        jsonMapper,
         taskWorkDir,
         indexIO,
         cache,

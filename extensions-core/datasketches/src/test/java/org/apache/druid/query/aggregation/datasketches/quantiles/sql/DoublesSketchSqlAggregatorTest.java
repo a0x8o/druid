@@ -24,6 +24,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import org.apache.calcite.schema.SchemaPlus;
 import org.apache.druid.common.config.NullHandling;
 import org.apache.druid.java.util.common.Pair;
 import org.apache.druid.java.util.common.StringUtils;
@@ -40,7 +41,12 @@ import org.apache.druid.query.aggregation.LongSumAggregatorFactory;
 import org.apache.druid.query.aggregation.PostAggregator;
 import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchAggregatorFactory;
 import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchModule;
+import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToCDFPostAggregator;
+import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToHistogramPostAggregator;
 import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToQuantilePostAggregator;
+import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToQuantilesPostAggregator;
+import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToRankPostAggregator;
+import org.apache.druid.query.aggregation.datasketches.quantiles.DoublesSketchToStringPostAggregator;
 import org.apache.druid.query.aggregation.post.ArithmeticPostAggregator;
 import org.apache.druid.query.aggregation.post.ExpressionPostAggregator;
 import org.apache.druid.query.aggregation.post.FieldAccessPostAggregator;
@@ -66,8 +72,6 @@ import org.apache.druid.sql.calcite.planner.DruidOperatorTable;
 import org.apache.druid.sql.calcite.planner.PlannerConfig;
 import org.apache.druid.sql.calcite.planner.PlannerContext;
 import org.apache.druid.sql.calcite.planner.PlannerFactory;
-import org.apache.druid.sql.calcite.schema.DruidSchema;
-import org.apache.druid.sql.calcite.schema.SystemSchema;
 import org.apache.druid.sql.calcite.util.CalciteTestBase;
 import org.apache.druid.sql.calcite.util.CalciteTests;
 import org.apache.druid.sql.calcite.util.QueryLogHook;
@@ -158,33 +162,39 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                    .interval(index.getDataInterval())
                    .version("1")
                    .shardSpec(new LinearShardSpec(0))
+                   .size(0)
                    .build(),
         index
     );
 
     final PlannerConfig plannerConfig = new PlannerConfig();
-    final DruidSchema druidSchema = CalciteTests.createMockSchema(conglomerate, walker, plannerConfig);
-    final SystemSchema systemSchema = CalciteTests.createMockSystemSchema(druidSchema, walker, plannerConfig);
     final DruidOperatorTable operatorTable = new DruidOperatorTable(
         ImmutableSet.of(
             new DoublesSketchApproxQuantileSqlAggregator(),
             new DoublesSketchObjectSqlAggregator()
         ),
         ImmutableSet.of(
-            new DoublesSketchQuantileOperatorConversion()
+            new DoublesSketchQuantileOperatorConversion(),
+            new DoublesSketchQuantilesOperatorConversion(),
+            new DoublesSketchToHistogramOperatorConversion(),
+            new DoublesSketchRankOperatorConversion(),
+            new DoublesSketchCDFOperatorConversion(),
+            new DoublesSketchSummaryOperatorConversion()
         )
     );
+    SchemaPlus rootSchema =
+        CalciteTests.createMockRootSchema(conglomerate, walker, plannerConfig, AuthTestUtils.TEST_AUTHORIZER_MAPPER);
 
     sqlLifecycleFactory = CalciteTests.createSqlLifecycleFactory(
         new PlannerFactory(
-            druidSchema,
-            systemSchema,
+            rootSchema,
             CalciteTests.createMockQueryLifecycleFactory(walker, conglomerate),
             operatorTable,
             CalciteTests.createExprMacroTable(),
             plannerConfig,
             AuthTestUtils.TEST_AUTHORIZER_MAPPER,
-            CalciteTests.getJsonMapper()
+            CalciteTests.getJsonMapper(),
+            CalciteTests.DRUID_SCHEMA_NAME
         )
     );
   }
@@ -213,7 +223,12 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                        + "FROM foo";
 
     // Verify results
-    final List<Object[]> results = sqlLifecycle.runSimple(sql, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = sqlLifecycle.runSimple(
+        sql,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
     final List<Object[]> expectedResults = ImmutableList.of(
         new Object[]{
             1.0,
@@ -293,7 +308,12 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                        + "FROM foo";
 
     // Verify results
-    final List<Object[]> results = lifecycle.runSimple(sql, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = lifecycle.runSimple(
+        sql,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
     final List<Object[]> expectedResults = ImmutableList.of(
         new Object[]{
             1.0,
@@ -352,7 +372,12 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                        + "FROM (SELECT dim2, SUM(m1) AS x FROM foo GROUP BY dim2)";
 
     // Verify results
-    final List<Object[]> results = sqlLifecycle.runSimple(sql, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = sqlLifecycle.runSimple(
+        sql,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
     final List<Object[]> expectedResults;
     if (NullHandling.replaceWithDefault()) {
       expectedResults = ImmutableList.of(new Object[]{7.0, 11.0});
@@ -421,7 +446,12 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                        + "FROM (SELECT dim1, dim2, APPROX_QUANTILE_DS(m1, 0.5) AS x FROM foo GROUP BY dim1, dim2) GROUP BY dim1";
 
 
-    final List<Object[]> results = sqlLifecycle.runSimple(sql, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = sqlLifecycle.runSimple(
+        sql,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
 
     ImmutableList.Builder<Object[]> builder = ImmutableList.builder();
     builder.add(new Object[]{"", 1.0});
@@ -456,7 +486,11 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                                         )
                                         .setPostAggregatorSpecs(
                                             ImmutableList.of(
-                                                new DoublesSketchToQuantilePostAggregator("a0", makeFieldAccessPostAgg("a0:agg"), 0.5f)
+                                                new DoublesSketchToQuantilePostAggregator(
+                                                    "a0",
+                                                    makeFieldAccessPostAgg("a0:agg"),
+                                                    0.5f
+                                                )
                                             )
                                         )
                                         .setContext(ImmutableMap.of(PlannerContext.CTX_SQL_QUERY_ID, "dummy"))
@@ -489,18 +523,51 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                        + "  APPROX_QUANTILE_DS(cnt, 0.5) + 1,\n"
                        + "  DS_GET_QUANTILE(DS_QUANTILES_SKETCH(cnt), 0.5) + 1000,\n"
                        + "  DS_GET_QUANTILE(DS_QUANTILES_SKETCH(cnt + 123), 0.5) + 1000,\n"
-                       + "  ABS(DS_GET_QUANTILE(DS_QUANTILES_SKETCH(cnt), 0.5))\n"
+                       + "  ABS(DS_GET_QUANTILE(DS_QUANTILES_SKETCH(cnt), 0.5)),\n"
+                       + "  DS_GET_QUANTILES(DS_QUANTILES_SKETCH(cnt), 0.5, 0.8),\n"
+                       + "  DS_HISTOGRAM(DS_QUANTILES_SKETCH(cnt), 0.2, 0.6),\n"
+                       + "  DS_RANK(DS_QUANTILES_SKETCH(cnt), 3),\n"
+                       + "  DS_CDF(DS_QUANTILES_SKETCH(cnt), 0.2, 0.6),\n"
+                       + "  DS_QUANTILE_SUMMARY(DS_QUANTILES_SKETCH(cnt))\n"
                        + "FROM foo";
 
     // Verify results
-    final List<Object[]> results = sqlLifecycle.runSimple(sql, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = sqlLifecycle.runSimple(
+        sql,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
     final List<Object[]> expectedResults = ImmutableList.of(
         new Object[]{
             6L,
             2.0d,
             1001.0d,
             1124.0d,
-            1.0d
+            1.0d,
+            "[1.0,1.0]",
+            "[0.0,0.0,6.0]",
+            1.0d,
+            "[0.0,0.0,1.0]",
+            "\n"
+              + "### Quantiles HeapUpdateDoublesSketch SUMMARY: \n"
+              + "   Empty                        : false\n"
+              + "   Direct, Capacity bytes       : false, \n"
+              + "   Estimation Mode              : false\n"
+              + "   K                            : 128\n"
+              + "   N                            : 6\n"
+              + "   Levels (Needed, Total, Valid): 0, 0, 0\n"
+              + "   Level Bit Pattern            : 0\n"
+              + "   BaseBufferCount              : 6\n"
+              + "   Combined Buffer Capacity     : 8\n"
+              + "   Retained Items               : 6\n"
+              + "   Compact Storage Bytes        : 80\n"
+              + "   Updatable Storage Bytes      : 96\n"
+              + "   Normalized Rank Error        : 1.406%\n"
+              + "   Normalized Rank Error (PMF)  : 1.711%\n"
+              + "   Min Value                    : 1.000000e+00\n"
+              + "   Max Value                    : 1.000000e+00\n"
+              + "### END SKETCH SUMMARY\n"
         }
     );
     Assert.assertEquals(expectedResults.size(), results.size());
@@ -575,7 +642,46 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
                                         ),
                                         0.5f
                                     ),
-                                    new ExpressionPostAggregator("p9", "abs(p8)", null, TestExprMacroTable.INSTANCE)
+                                    new ExpressionPostAggregator("p9", "abs(p8)", null, TestExprMacroTable.INSTANCE),
+                                    new DoublesSketchToQuantilesPostAggregator(
+                                        "p11",
+                                        new FieldAccessPostAggregator(
+                                            "p10",
+                                            "a2:agg"
+                                        ),
+                                        new double[]{0.5d, 0.8d}
+                                    ),
+                                    new DoublesSketchToHistogramPostAggregator(
+                                        "p13",
+                                        new FieldAccessPostAggregator(
+                                            "p12",
+                                            "a2:agg"
+                                        ),
+                                        new double[]{0.2d, 0.6d}
+                                    ),
+                                    new DoublesSketchToRankPostAggregator(
+                                        "p15",
+                                        new FieldAccessPostAggregator(
+                                            "p14",
+                                            "a2:agg"
+                                        ),
+                                        3.0d
+                                    ),
+                                    new DoublesSketchToCDFPostAggregator(
+                                        "p17",
+                                        new FieldAccessPostAggregator(
+                                            "p16",
+                                            "a2:agg"
+                                        ),
+                                        new double[]{0.2d, 0.6d}
+                                    ),
+                                    new DoublesSketchToStringPostAggregator(
+                                        "p19",
+                                        new FieldAccessPostAggregator(
+                                            "p18",
+                                            "a2:agg"
+                                        )
+                                    )
                                 )
                                 .context(ImmutableMap.of(
                                     "skipEmptyBuckets",
@@ -598,7 +704,12 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
     final String sql2 = StringUtils.format("SELECT DS_GET_QUANTILE(y, 0.5), DS_GET_QUANTILE(y, 0.98) from (%s)", sql);
 
     // Verify results
-    final List<Object[]> results = sqlLifecycle.runSimple(sql2, QUERY_CONTEXT_DEFAULT, authenticationResult).toList();
+    final List<Object[]> results = sqlLifecycle.runSimple(
+        sql2,
+        QUERY_CONTEXT_DEFAULT,
+        DEFAULT_PARAMETERS,
+        authenticationResult
+    ).toList();
     final List<Object[]> expectedResults = ImmutableList.of(
         new Object[]{
             4.0d,
@@ -626,9 +737,17 @@ public class DoublesSketchSqlAggregatorTest extends CalciteTestBase
               .postAggregators(
                   ImmutableList.of(
                       new FieldAccessPostAggregator("p0", "a0:agg"),
-                      new DoublesSketchToQuantilePostAggregator("p2", new FieldAccessPostAggregator("p1", "a0:agg"), 0.5),
+                      new DoublesSketchToQuantilePostAggregator(
+                          "p2",
+                          new FieldAccessPostAggregator("p1", "a0:agg"),
+                          0.5
+                      ),
                       new DoublesSketchToQuantilePostAggregator("s1", new FieldAccessPostAggregator("s0", "p0"), 0.5),
-                      new DoublesSketchToQuantilePostAggregator("s3", new FieldAccessPostAggregator("s2", "p0"), 0.9800000190734863)
+                      new DoublesSketchToQuantilePostAggregator(
+                          "s3",
+                          new FieldAccessPostAggregator("s2", "p0"),
+                          0.9800000190734863
+                      )
                   )
               )
               .context(ImmutableMap.of(
