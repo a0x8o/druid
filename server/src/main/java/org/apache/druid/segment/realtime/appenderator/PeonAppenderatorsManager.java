@@ -32,6 +32,7 @@ import org.apache.druid.query.SegmentDescriptor;
 import org.apache.druid.segment.IndexIO;
 import org.apache.druid.segment.IndexMerger;
 import org.apache.druid.segment.indexing.DataSchema;
+import org.apache.druid.segment.join.JoinableFactory;
 import org.apache.druid.segment.loading.DataSegmentPusher;
 import org.apache.druid.segment.realtime.FireDepartmentMetrics;
 import org.apache.druid.server.coordination.DataSegmentAnnouncer;
@@ -64,13 +65,14 @@ public class PeonAppenderatorsManager implements AppenderatorsManager
       AppenderatorConfig config,
       FireDepartmentMetrics metrics,
       DataSegmentPusher dataSegmentPusher,
-      ObjectMapper objectMapper,
+      ObjectMapper jsonMapper,
       IndexIO indexIO,
       IndexMerger indexMerger,
       QueryRunnerFactoryConglomerate conglomerate,
       DataSegmentAnnouncer segmentAnnouncer,
       ServiceEmitter emitter,
       ExecutorService queryExecutorService,
+      JoinableFactory joinableFactory,
       Cache cache,
       CacheConfig cacheConfig,
       CachePopulatorStats cachePopulatorStats
@@ -82,17 +84,19 @@ public class PeonAppenderatorsManager implements AppenderatorsManager
       throw new ISE("A batch appenderator was already created for this peon's task.");
     } else {
       realtimeAppenderator = Appenderators.createRealtime(
+          taskId,
           schema,
           config,
           metrics,
           dataSegmentPusher,
-          objectMapper,
+          jsonMapper,
           indexIO,
           indexMerger,
           conglomerate,
           segmentAnnouncer,
           emitter,
           queryExecutorService,
+          joinableFactory,
           cache,
           cacheConfig,
           cachePopulatorStats
@@ -119,6 +123,7 @@ public class PeonAppenderatorsManager implements AppenderatorsManager
       throw new ISE("A realtime appenderator was already created for this peon's task.");
     } else {
       batchAppenderator = Appenderators.createOffline(
+          taskId,
           schema,
           config,
           storeCompactionState,

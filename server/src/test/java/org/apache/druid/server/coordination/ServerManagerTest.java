@@ -63,6 +63,7 @@ import org.apache.druid.segment.QueryableIndex;
 import org.apache.druid.segment.ReferenceCountingSegment;
 import org.apache.druid.segment.Segment;
 import org.apache.druid.segment.StorageAdapter;
+import org.apache.druid.segment.join.NoopJoinableFactory;
 import org.apache.druid.segment.loading.SegmentLoader;
 import org.apache.druid.segment.loading.SegmentLoadingException;
 import org.apache.druid.server.SegmentManager;
@@ -121,7 +122,7 @@ public class ServerManagerTest
           }
 
           @Override
-          public Segment getSegment(final DataSegment segment)
+          public Segment getSegment(final DataSegment segment, boolean lazy)
           {
             return new SegmentForTesting(
                 MapUtils.getString(segment.getLoadSpec(), "version"),
@@ -158,6 +159,7 @@ public class ServerManagerTest
         new LocalCacheProvider().get(),
         new CacheConfig(),
         segmentManager,
+        NoopJoinableFactory.INSTANCE,
         new ServerConfig()
     );
 
@@ -478,7 +480,8 @@ public class ServerManagerTest
               NoneShardSpec.instance(),
               IndexIO.CURRENT_VERSION_ID,
               123L
-          )
+          ),
+          false
       );
     }
     catch (SegmentLoadingException e) {

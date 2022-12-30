@@ -20,16 +20,15 @@
 package org.apache.druid.indexing.common.task;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import org.apache.druid.data.input.FirehoseFactory;
 import org.apache.druid.indexer.TaskStatus;
-import org.apache.druid.indexer.partitions.HashedPartitionsSpec;
-import org.apache.druid.indexer.partitions.PartitionsSpec;
 import org.apache.druid.indexing.common.LockGranularity;
 import org.apache.druid.indexing.common.TaskLock;
 import org.apache.druid.indexing.common.TaskLockType;
 import org.apache.druid.indexing.common.TaskToolbox;
-import org.apache.druid.indexing.common.actions.SegmentListUsedAction;
+import org.apache.druid.indexing.common.actions.RetrieveUsedSegmentsAction;
 import org.apache.druid.indexing.common.actions.TaskActionClient;
 import org.apache.druid.indexing.common.actions.TimeChunkLockTryAcquireAction;
 import org.apache.druid.indexing.common.config.TaskConfig;
@@ -37,36 +36,31 @@ import org.apache.druid.indexing.common.task.IndexTask.IndexIOConfig;
 import org.apache.druid.indexing.common.task.IndexTask.IndexTuningConfig;
 import org.apache.druid.indexing.firehose.IngestSegmentFirehoseFactory;
 import org.apache.druid.indexing.firehose.WindowedSegmentId;
+import org.apache.druid.indexing.overlord.Segments;
 import org.apache.druid.java.util.common.JodaUtils;
-import org.apache.druid.java.util.common.Pair;
 import org.apache.druid.java.util.common.granularity.Granularity;
 import org.apache.druid.java.util.common.granularity.GranularityType;
 import org.apache.druid.java.util.common.logger.Logger;
 import org.apache.druid.segment.indexing.granularity.GranularitySpec;
 import org.apache.druid.timeline.DataSegment;
-import org.apache.druid.timeline.TimelineObjectHolder;
+import org.apache.druid.timeline.Partitions;
 import org.apache.druid.timeline.VersionedIntervalTimeline;
-import org.apache.druid.timeline.partition.HashBasedNumberedShardSpecFactory;
-import org.apache.druid.timeline.partition.PartitionChunk;
-import org.apache.druid.timeline.partition.ShardSpecFactory;
+import org.apache.druid.timeline.partition.HashBasedNumberedShardSpec;
 import org.joda.time.Interval;
 import org.joda.time.Period;
 
-import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.SortedSet;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
 /**
  * Abstract class for batch tasks like {@link IndexTask}.
@@ -77,24 +71,17 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
 {
   private static final Logger log = new Logger(AbstractBatchIndexTask.class);
 
-  private final SegmentLockHelper segmentLockHelper;
-
   @GuardedBy("this")
   private final TaskResourceCleaner resourceCloserOnAbnormalExit = new TaskResourceCleaner();
-
-  /**
-   * State to indicate that this task will use segmentLock or timeChunkLock.
-   * This is automatically set when {@link #determineLockGranularityandTryLock} is called.
-   */
-  private boolean useSegmentLock;
 
   @GuardedBy("this")
   private boolean stopped = false;
 
+  private TaskLockHelper taskLockHelper;
+
   protected AbstractBatchIndexTask(String id, String dataSource, Map<String, Object> context)
   {
     super(id, dataSource, context);
-    segmentLockHelper = new SegmentLockHelper();
   }
 
   protected AbstractBatchIndexTask(
@@ -106,7 +93,6 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
   )
   {
     super(id, groupId, taskResource, dataSource, context);
-    segmentLockHelper = new SegmentLockHelper();
   }
 
   /**
@@ -187,14 +173,15 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
   @Nullable
   public abstract Granularity getSegmentGranularity();
 
-  public boolean isUseSegmentLock()
+  @Override
+  public int getPriority()
   {
-    return useSegmentLock;
+    return getContextValue(Tasks.PRIORITY_KEY, Tasks.DEFAULT_BATCH_INDEX_TASK_PRIORITY);
   }
 
-  public SegmentLockHelper getSegmentLockHelper()
+  public TaskLockHelper getTaskLockHelper()
   {
-    return segmentLockHelper;
+    return Preconditions.checkNotNull(taskLockHelper, "taskLockHelper is not initialized yet");
   }
 
   /**
@@ -222,7 +209,7 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
     // Respect task context value most.
     if (forceTimeChunkLock) {
       log.info("[%s] is set to true in task context. Use timeChunk lock", Tasks.FORCE_TIME_CHUNK_LOCK_KEY);
-      useSegmentLock = false;
+      taskLockHelper = new TaskLockHelper(false);
       if (!intervals.isEmpty()) {
         return tryTimeChunkLock(client, intervals);
       } else {
@@ -231,7 +218,7 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
     } else {
       if (!intervals.isEmpty()) {
         final LockGranularityDetermineResult result = determineSegmentGranularity(client, intervals);
-        useSegmentLock = result.lockGranularity == LockGranularity.SEGMENT;
+        taskLockHelper = new TaskLockHelper(result.lockGranularity == LockGranularity.SEGMENT);
         return tryLockWithDetermineResult(client, result);
       } else {
         return true;
@@ -248,14 +235,14 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
     );
     if (forceTimeChunkLock) {
       log.info("[%s] is set to true in task context. Use timeChunk lock", Tasks.FORCE_TIME_CHUNK_LOCK_KEY);
-      useSegmentLock = false;
+      taskLockHelper = new TaskLockHelper(false);
       return tryTimeChunkLock(
           client,
           new ArrayList<>(segments.stream().map(DataSegment::getInterval).collect(Collectors.toSet()))
       );
     } else {
       final LockGranularityDetermineResult result = determineSegmentGranularity(segments);
-      useSegmentLock = result.lockGranularity == LockGranularity.SEGMENT;
+      taskLockHelper = new TaskLockHelper(result.lockGranularity == LockGranularity.SEGMENT);
       return tryLockWithDetermineResult(client, result);
     }
   }
@@ -291,7 +278,7 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
     if (result.lockGranularity == LockGranularity.TIME_CHUNK) {
       return tryTimeChunkLock(client, Preconditions.checkNotNull(result.intervals, "intervals"));
     } else {
-      return segmentLockHelper.verifyAndLockExistingSegments(
+      return taskLockHelper.verifyAndLockExistingSegments(
           client,
           Preconditions.checkNotNull(result.segments, "segments")
       );
@@ -352,15 +339,12 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
             segments
         );
 
-        final List<DataSegment> segmentsToLock = timeline
-            .lookup(JodaUtils.umbrellaInterval(intervals))
-            .stream()
-            .map(TimelineObjectHolder::getObject)
-            .flatMap(partitionHolder -> StreamSupport.stream(partitionHolder.spliterator(), false))
-            .map(PartitionChunk::getObject)
-            .collect(Collectors.toList());
+        Set<DataSegment> segmentsToLock = timeline.findNonOvershadowedObjectsInInterval(
+            JodaUtils.umbrellaInterval(intervals),
+            Partitions.ONLY_COMPLETE
+        );
         log.info("No segmentGranularity change detected and it's not perfect rollup. Using segment lock");
-        return new LockGranularityDetermineResult(LockGranularity.SEGMENT, null, segmentsToLock);
+        return new LockGranularityDetermineResult(LockGranularity.SEGMENT, null, new ArrayList<>(segmentsToLock));
       }
     } else {
       // Set useSegmentLock even though we don't get any locks.
@@ -373,7 +357,7 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
   /**
    * We currently don't support appending perfectly rolled up segments. This might be supported in the future if there
    * is a good use case. If we want to support appending perfectly rolled up segments, we need to fix some other places
-   * first. For example, {@link org.apache.druid.timeline.partition.HashBasedNumberedShardSpec#getLookup} assumes that
+   * first. For example, {@link HashBasedNumberedShardSpec#getLookup} assumes that
    * the start partition ID of the set of perfectly rolled up segments is 0. Instead it might need to store an ordinal
    * in addition to the partition ID which represents the ordinal in the perfectly rolled up segment set.
    */
@@ -384,14 +368,6 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
         "Perfect rollup cannot be guaranteed when appending to existing dataSources"
     );
     return tuningConfig.isForceGuaranteedRollup();
-  }
-
-  static Pair<ShardSpecFactory, Integer> createShardSpecFactoryForGuaranteedRollup(
-      int numShards,
-      @Nullable List<String> partitionDimensions
-  )
-  {
-    return Pair.of(new HashBasedNumberedShardSpecFactory(partitionDimensions, numShards), numShards);
   }
 
   @Nullable
@@ -412,45 +388,6 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
   }
 
   /**
-   * Creates shard specs based on the given configurations. The return value is a map between intervals created
-   * based on the segment granularity and the shard specs to be created.
-   * Note that the shard specs to be created is a pair of {@link ShardSpecFactory} and number of segments per interval
-   * and filled only when {@link #isGuaranteedRollup} = true. Otherwise, the return value contains only the set of
-   * intervals generated based on the segment granularity.
-   */
-  protected static Map<Interval, Pair<ShardSpecFactory, Integer>> createShardSpecWithoutInputScan(
-      GranularitySpec granularitySpec,
-      IndexIOConfig ioConfig,
-      IndexTuningConfig tuningConfig,
-      @Nonnull PartitionsSpec nonNullPartitionsSpec
-  )
-  {
-    final Map<Interval, Pair<ShardSpecFactory, Integer>> allocateSpec = new HashMap<>();
-    final SortedSet<Interval> intervals = granularitySpec.bucketIntervals().get();
-
-    if (isGuaranteedRollup(ioConfig, tuningConfig)) {
-      // SingleDimensionPartitionsSpec or more partitionsSpec types will be supported in the future.
-      assert nonNullPartitionsSpec instanceof HashedPartitionsSpec;
-      // Overwrite mode, guaranteed rollup: shardSpecs must be known in advance.
-      final HashedPartitionsSpec partitionsSpec = (HashedPartitionsSpec) nonNullPartitionsSpec;
-      final int numShards = partitionsSpec.getNumShards() == null ? 1 : partitionsSpec.getNumShards();
-
-      for (Interval interval : intervals) {
-        allocateSpec.put(
-            interval,
-            createShardSpecFactoryForGuaranteedRollup(numShards, partitionsSpec.getPartitionDimensions())
-        );
-      }
-    } else {
-      for (Interval interval : intervals) {
-        allocateSpec.put(interval, null);
-      }
-    }
-
-    return allocateSpec;
-  }
-
-  /**
    * If the given firehoseFactory is {@link IngestSegmentFirehoseFactory}, then it finds the segments to lock
    * from the firehoseFactory. This is because those segments will be read by this task no matter what segments would be
    * filtered by intervalsToRead, so they need to be locked.
@@ -458,6 +395,9 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
    * However, firehoseFactory is not IngestSegmentFirehoseFactory, it means this task will overwrite some segments
    * with data read from some input source outside of Druid. As a result, only the segments falling in intervalsToRead
    * should be locked.
+   *
+   * The order of segments within the returned list is unspecified, but each segment is guaranteed to appear in the list
+   * only once.
    */
   protected static List<DataSegment> findInputSegments(
       String dataSource,
@@ -475,20 +415,22 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
             "input interval"
         );
 
-        return actionClient.submit(
-            new SegmentListUsedAction(dataSource, null, Collections.singletonList(inputInterval))
+        return ImmutableList.copyOf(
+            actionClient.submit(
+                new RetrieveUsedSegmentsAction(dataSource, inputInterval, null, Segments.ONLY_VISIBLE)
+            )
         );
       } else {
-        final List<String> inputSegmentIds = inputSegments.stream()
-                                                          .map(WindowedSegmentId::getSegmentId)
-                                                          .collect(Collectors.toList());
-        final List<DataSegment> dataSegmentsInIntervals = actionClient.submit(
-            new SegmentListUsedAction(
+        final List<String> inputSegmentIds =
+            inputSegments.stream().map(WindowedSegmentId::getSegmentId).collect(Collectors.toList());
+        final Collection<DataSegment> dataSegmentsInIntervals = actionClient.submit(
+            new RetrieveUsedSegmentsAction(
                 dataSource,
                 null,
                 inputSegments.stream()
                              .flatMap(windowedSegmentId -> windowedSegmentId.getIntervals().stream())
-                             .collect(Collectors.toSet())
+                             .collect(Collectors.toSet()),
+                Segments.ONLY_VISIBLE
             )
         );
         return dataSegmentsInIntervals.stream()
@@ -496,7 +438,11 @@ public abstract class AbstractBatchIndexTask extends AbstractTask
                                       .collect(Collectors.toList());
       }
     } else {
-      return actionClient.submit(new SegmentListUsedAction(dataSource, null, intervalsToRead));
+      return ImmutableList.copyOf(
+          actionClient.submit(
+              new RetrieveUsedSegmentsAction(dataSource, null, intervalsToRead, Segments.ONLY_VISIBLE)
+          )
+      );
     }
   }
 
